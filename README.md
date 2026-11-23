@@ -25,7 +25,12 @@ make install      # installs to $GOPATH/bin/mplex
 make release-local # cross-compiles darwin/{arm64,amd64} & linux/{amd64,arm64}
 ```
 
-Prebuilt tarballs for `darwin/arm64`, `darwin/amd64`, `linux/amd64`, and `linux/arm64` are also attached to [GitHub Releases](https://github.com/EricWF/mplex/releases).
+Prebuilt tarballs for `darwin/arm64`, `darwin/amd64`, `linux/amd64`, and `linux/arm64` are attached to [GitHub Releases](https://github.com/EricWF/mplex/releases). For example, on an Apple Silicon Mac:
+
+```bash
+mkdir -p ~/.local/bin
+curl -sSL https://github.com/EricWF/mplex/releases/latest/download/mplex-darwin-arm64.tar.gz | tar -xz -C ~/.local/bin
+```
 
 > **Note for macOS:** `mplex` tracks each session's live foreground process via native `sysctl` (`kern.proc.pid`) and live working directory via OSC 7 (automatically emitted by Ghostty, Kitty, WezTerm, iTerm2, and macOS Terminal/zsh).
 
