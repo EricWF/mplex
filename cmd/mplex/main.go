@@ -384,6 +384,7 @@ func switchInsideMplex(socketPath, target string, createIfMissing bool, scrollba
 		sess, createErr := rc.Create(protocol.CreateReq{
 			Name:       target,
 			Cwd:        wd,
+			Shell:      os.Getenv("SHELL"),
 			Env:        os.Environ(),
 			Size:       protocol.WinSize{Rows: 24, Cols: 80},
 			Scrollback: scrollback,

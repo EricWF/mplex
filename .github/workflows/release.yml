@@ -37,6 +37,11 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "true" ]; then
+              gh release delete "$TAG" --yes
+            fi
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.tar.gz dist/checksums.txt --clobber
           else
             gh release create "$TAG" dist/*.tar.gz dist/checksums.txt \

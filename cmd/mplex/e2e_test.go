@@ -671,3 +671,80 @@ func TestLLMFriendlyCLIEndToEnd(t *testing.T) {
 		t.Fatalf("unexpected kill json: %s (err=%v)", killOut, err)
 	}
 }
+
+func TestMultipleShellsSupported(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+
+	// Prepare clean HOME/ZDOTDIR so zsh doesn't launch newuser wizard and fish has writable config dir.
+	fakeHome := filepath.Join(tmp, "home")
+	if err := os.MkdirAll(fakeHome, 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(fakeHome, ".zshrc"), []byte("# test\n"), 0o644)
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	candidates := []string{"sh", "bash", "zsh", "fish"}
+	tested := 0
+	for _, shName := range candidates {
+		shPath, err := exec.LookPath(shName)
+		if err != nil {
+			continue
+		}
+		tested++
+		t.Run(shName, func(t *testing.T) {
+			sessName := "sess-" + shName
+			env := append(os.Environ(),
+				"HOME="+fakeHome,
+				"ZDOTDIR="+fakeHome,
+				"SHELL="+shPath,
+				"TERM=xterm-256color",
+				"MPLEX_SESSION=",
+				"MPLEX_SESSION_ID=",
+				"MPLEX_SOCKET=",
+				"MPLEX_NO_UPDATE_CHECK=1",
+			)
+
+			// Create session relying purely on the caller's SHELL env (even on a shared daemon).
+			mk := exec.Command(bin, "--socket", sock, "new", sessName, "-d", "--json")
+			mk.Env = env
+			if out, err := mk.CombinedOutput(); err != nil {
+				t.Fatalf("new %s failed: %v\n%s", shName, err, out)
+			}
+
+			// Send a command valid across sh, bash, zsh, AND fish!
+			send := exec.Command(bin, "--socket", sock, "send", sessName, "echo SHELL_MULTI:$MPLEX_SESSION", "--enter")
+			send.Env = env
+			if out, err := send.CombinedOutput(); err != nil {
+				t.Fatalf("send %s failed: %v\n%s", shName, err, out)
+			}
+
+			want := "SHELL_MULTI:" + sessName
+			deadline := time.Now().Add(5 * time.Second)
+			var lastCap string
+			for time.Now().Before(deadline) {
+				cp := exec.Command(bin, "--socket", sock, "capture", sessName)
+				cp.Env = env
+				if out, err := cp.CombinedOutput(); err == nil {
+					lastCap = string(out)
+					if strings.Contains(lastCap, want) {
+						return
+					}
+				}
+				time.Sleep(40 * time.Millisecond)
+			}
+			t.Fatalf("shell %s (%s) did not produce %q\n--- CAPTURE ---\n%s", shName, shPath, want, lastCap)
+		})
+	}
+	if tested == 0 {
+		t.Fatalf("no shells found to test")
+	}
+}
