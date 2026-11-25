@@ -387,3 +387,12 @@ func (rc *RPCConn) SendToSession(target string, data []byte) (protocol.SendResp,
 	}
 	return resp, err
 }
+
+func (rc *RPCConn) Follow(req protocol.FollowReq) (protocol.FollowResp, error) {
+	var resp protocol.FollowResp
+	err := rc.call(protocol.MsgFollowReq, req, protocol.MsgFollowResp, &resp)
+	if err == nil && resp.Error != "" {
+		err = errors.New(resp.Error)
+	}
+	return resp, err
+}

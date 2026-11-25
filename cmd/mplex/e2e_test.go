@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,11 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/creack/pty"
 
+	"github.com/EricWF/mplex/internal/client"
 	"github.com/EricWF/mplex/internal/protocol"
 	"github.com/EricWF/mplex/internal/vt"
 )
@@ -746,5 +750,334 @@ func TestMultipleShellsSupported(t *testing.T) {
 	}
 	if tested == 0 {
 		t.Fatalf("no shells found to test")
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestWaitAndFollowCLIEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	cleanEnv := append(os.Environ(),
+		"SHELL=/bin/sh",
+		"PS1=P$ ",
+		"TERM=xterm-256color",
+		"MPLEX_SESSION=",
+		"MPLEX_SESSION_ID=",
+		"MPLEX_SOCKET=",
+		"MPLEX_NO_UPDATE_CHECK=1",
+	)
+
+	runCLI := func(args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(bin, append([]string{"--socket", sock}, args...)...)
+		cmd.Env = cleanEnv
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("mplex %v failed: %v\n%s", args, err, out)
+		}
+		return out
+	}
+
+	// 1. Create a detached worker session.
+	runCLI("new", "worker", "-d", "--", "/bin/sh")
+
+	// 2. `mplex wait` with NO conditions returns a clear usage error (non-zero exit).
+	noCond := exec.Command(bin, "--socket", sock, "wait", "worker")
+	noCond.Env = cleanEnv
+	if out, err := noCond.CombinedOutput(); err == nil {
+		t.Fatalf("expected error when mplex wait has no conditions, got output: %s", out)
+	}
+
+	// 3. `mplex wait --match` + `--scrollback` with flags in arbitrary order!
+	runCLI("send", "worker", "i=1; while [ $i -le 30 ]; do echo W_LINE_$i; i=$((i+1)); done; sleep 0.1; echo BUILD_READY_99", "--enter")
+	waitMatchOut := runCLI("wait", "worker", "--match", `BUILD_READY_\d+`, "--scrollback", "--timeout", "5s", "--json")
+	var matchRes client.WaitResult
+	if err := json.Unmarshal(waitMatchOut, &matchRes); err != nil {
+		t.Fatalf("unmarshal wait match json: %v\n%s", err, waitMatchOut)
+	}
+	if !matchRes.Matched || matchRes.Reason != "match" || !strings.Contains(matchRes.MatchLine, "BUILD_READY_99") {
+		t.Fatalf("unexpected wait match result: %+v", matchRes)
+	}
+	if !strings.Contains(matchRes.Text, "W_LINE_1") {
+		t.Fatalf("expected scrollback W_LINE_1 in match text:\n%s", matchRes.Text)
+	}
+
+	// Also verify flags BEFORE positional target work.
+	waitBeforeOut := runCLI("wait", "--match", "BUILD_READY_99", "--timeout", "3s", "worker", "--json")
+	var matchBeforeRes client.WaitResult
+	if err := json.Unmarshal(waitBeforeOut, &matchBeforeRes); err != nil || !matchBeforeRes.Matched {
+		t.Fatalf("wait with flags before target failed: err=%v out=%s", err, waitBeforeOut)
+	}
+
+	// 4. `mplex wait --idle` waits until output settles.
+	runCLI("send", "worker", "sleep 0.1; echo IDLE_DONE_OK", "--enter")
+	waitIdleOut := runCLI("wait", "worker", "--idle", "200ms", "--timeout", "5s", "--json")
+	var idleRes client.WaitResult
+	if err := json.Unmarshal(waitIdleOut, &idleRes); err != nil {
+		t.Fatalf("unmarshal wait idle json: %v\n%s", err, waitIdleOut)
+	}
+	if !idleRes.Matched || idleRes.Reason != "idle" || !strings.Contains(idleRes.Text, "IDLE_DONE_OK") {
+		t.Fatalf("unexpected wait idle result: %+v", idleRes)
+	}
+
+	// 5. `mplex wait` timeout exits non-zero AND emits structured JSON when `--json` is passed.
+	timeoutCmd := exec.Command(bin, "--socket", sock, "wait", "worker", "--match", "NEVER_GONNA_APPEAR", "--timeout", "150ms", "--json")
+	timeoutCmd.Env = cleanEnv
+	var timeoutStdout, timeoutStderr bytes.Buffer
+	timeoutCmd.Stdout = &timeoutStdout
+	timeoutCmd.Stderr = &timeoutStderr
+	if err := timeoutCmd.Run(); err == nil {
+		t.Fatalf("expected non-zero exit on wait timeout, stdout=%s stderr=%s", timeoutStdout.String(), timeoutStderr.String())
+	}
+	var timeoutRes client.WaitResult
+	if err := json.Unmarshal(timeoutStdout.Bytes(), &timeoutRes); err != nil {
+		t.Fatalf("unmarshal timeout json: %v\nstdout=%s\nstderr=%s", err, timeoutStdout.String(), timeoutStderr.String())
+	}
+	if timeoutRes.Matched || timeoutRes.Reason != "timeout" {
+		t.Fatalf("unexpected timeout result: %+v", timeoutRes)
+	}
+
+	// 6. `mplex wait --exit` waits until a short-lived session exits cleanly.
+	runCLI("new", "shortjob", "-d", "--", "/bin/sh", "-c", "sleep 0.15; echo JOB_DONE")
+	waitExitOut := runCLI("wait", "shortjob", "--exit", "--timeout", "5s", "--json")
+	var exitRes client.WaitResult
+	if err := json.Unmarshal(waitExitOut, &exitRes); err != nil {
+		t.Fatalf("unmarshal wait exit json: %v\n%s", err, waitExitOut)
+	}
+	if !exitRes.Matched || exitRes.Reason != "exit" {
+		t.Fatalf("unexpected wait exit result: %+v", exitRes)
+	}
+
+	// 7. Read-Only Live Follow (`mplex follow` AND `mplex logs -f`) WITHOUT detaching an active PTY client!
+	activeCmd := exec.Command(bin, "--socket", sock, "new", "app")
+	activeCmd.Env = cleanEnv
+	ptmx, err := pty.StartWithSize(activeCmd, &pty.Winsize{Rows: 24, Cols: 90})
+	if err != nil {
+		t.Fatalf("pty.StartWithSize: %v", err)
+	}
+	defer ptmx.Close()
+
+	var outerMu sync.Mutex
+	outer := vt.New(24, 90, 1000)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			n, err := ptmx.Read(buf)
+			if n > 0 {
+				outerMu.Lock()
+				outer.Write(buf[:n])
+				outerMu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	activeDone := make(chan error, 1)
+	go func() { activeDone <- activeCmd.Wait() }()
+
+	outerHas := func(substr string) bool {
+		outerMu.Lock()
+		defer outerMu.Unlock()
+		s := outer.Active()
+		for r := 0; r < s.Rows; r++ {
+			var b strings.Builder
+			for _, c := range s.Lines[r].Cells {
+				if c.Width == 0 {
+					continue
+				}
+				if c.Rune == 0 {
+					b.WriteByte(' ')
+				} else {
+					b.WriteRune(c.Rune)
+				}
+			}
+			if strings.Contains(b.String(), substr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	waitSessionAttached(t, bin, sock, "app")
+	_, _ = ptmx.Write([]byte("echo APP_HISTORY_SEED\n"))
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !outerHas("APP_HISTORY_SEED") {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !outerHas("APP_HISTORY_SEED") {
+		t.Fatalf("active interactive client did not receive APP_HISTORY_SEED")
+	}
+
+	// Start `mplex follow app --history` AND `mplex logs -f app` concurrently.
+	followBuf := &lockedBuffer{}
+	followCmd := exec.Command(bin, "--socket", sock, "follow", "app", "--history")
+	followCmd.Env = cleanEnv
+	followCmd.Stdout = followBuf
+	if err := followCmd.Start(); err != nil {
+		t.Fatalf("start mplex follow: %v", err)
+	}
+	followDone := make(chan error, 1)
+	go func() { followDone <- followCmd.Wait() }()
+
+	logsBuf := &lockedBuffer{}
+	logsCmd := exec.Command(bin, "--socket", sock, "logs", "-f", "app")
+	logsCmd.Env = cleanEnv
+	logsCmd.Stdout = logsBuf
+	if err := logsCmd.Start(); err != nil {
+		t.Fatalf("start mplex logs -f: %v", err)
+	}
+	logsDone := make(chan error, 1)
+	go func() { logsDone <- logsCmd.Wait() }()
+
+	// Wait until follow --history receives the initial history snapshot (confirms both followers have connected).
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(followBuf.String(), "APP_HISTORY_SEED") {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !strings.Contains(followBuf.String(), "APP_HISTORY_SEED") {
+		t.Fatalf("mplex follow --history did not emit initial history; got %q", followBuf.String())
+	}
+
+	// Emit live output via the active interactive PTY (also proving it was NOT detached!).
+	// Retry once briefly in case logs -f was still finishing its handshake.
+	deadline = time.Now().Add(5 * time.Second)
+	for i := 0; time.Now().Before(deadline); i++ {
+		if i == 0 || (i%10 == 0 && !strings.Contains(logsBuf.String(), "LIVE_FOLLOW_TOKEN")) {
+			_, _ = ptmx.Write([]byte("echo LIVE_FOLLOW_TOKEN\n"))
+		}
+		if outerHas("LIVE_FOLLOW_TOKEN") &&
+			strings.Contains(followBuf.String(), "LIVE_FOLLOW_TOKEN") &&
+			strings.Contains(logsBuf.String(), "LIVE_FOLLOW_TOKEN") {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !outerHas("LIVE_FOLLOW_TOKEN") {
+		t.Fatalf("active interactive client lost LIVE_FOLLOW_TOKEN (detached?)")
+	}
+	if !strings.Contains(followBuf.String(), "LIVE_FOLLOW_TOKEN") {
+		t.Fatalf("mplex follow did not stream LIVE_FOLLOW_TOKEN; got %q", followBuf.String())
+	}
+	if !strings.Contains(logsBuf.String(), "LIVE_FOLLOW_TOKEN") {
+		t.Fatalf("mplex logs -f did not stream LIVE_FOLLOW_TOKEN; got %q", logsBuf.String())
+	}
+
+	// Verify active PTY client is STILL alive and attached!
+	select {
+	case err := <-activeDone:
+		t.Fatalf("active interactive client exited unexpectedly while being followed (err=%v)", err)
+	default:
+	}
+
+	// Send SIGINT to `mplex logs -f` -> must exit cleanly with code 0!
+	if err := logsCmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("SIGINT to mplex logs -f: %v", err)
+	}
+	select {
+	case err := <-logsDone:
+		if err != nil {
+			t.Fatalf("mplex logs -f exited non-zero on SIGINT: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("mplex logs -f did not exit after SIGINT")
+	}
+
+	// Active interactive client STILL works after follower disconnected!
+	_, _ = ptmx.Write([]byte("echo STILL_ATTACHED_AFTER_UNFOLLOW\n"))
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !outerHas("STILL_ATTACHED_AFTER_UNFOLLOW") {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !outerHas("STILL_ATTACHED_AFTER_UNFOLLOW") {
+		t.Fatalf("active interactive client did not receive output after follower disconnected")
+	}
+
+	// Exit the session -> `mplex follow` must exit cleanly with code 0!
+	_, _ = ptmx.Write([]byte("exit 0\n"))
+	select {
+	case err := <-followDone:
+		if err != nil {
+			t.Fatalf("mplex follow exited non-zero on session exit: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("mplex follow did not exit when session exited")
+	}
+	// Since "worker" is still alive, activeCmd opens the switcher; press Esc to exit cleanly.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		outerMu.Lock()
+		inAlt := outer.InAltScreen
+		outerMu.Unlock()
+		if inAlt {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	_, _ = ptmx.Write([]byte{0x1b})
+	select {
+	case <-activeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("active client did not exit after Esc on switcher")
+	}
+
+	// 8. Smoke test `mplex mcp` subprocess stdio: strictly valid JSON-RPC 2.0 on stdout!
+	mcpCmd := exec.Command(bin, "--socket", sock, "mcp")
+	mcpCmd.Env = cleanEnv
+	mcpIn := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"ping"}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}`,
+	}, "\n") + "\n"
+	mcpCmd.Stdin = strings.NewReader(mcpIn)
+	var mcpOut, mcpErr bytes.Buffer
+	mcpCmd.Stdout = &mcpOut
+	mcpCmd.Stderr = &mcpErr
+	if err := mcpCmd.Run(); err != nil {
+		t.Fatalf("mplex mcp failed: %v\nstderr=%s\nstdout=%s", err, mcpErr.String(), mcpOut.String())
+	}
+
+	scanner := bufio.NewScanner(&mcpOut)
+	lineCount := 0
+	for scanner.Scan() {
+		lineCount++
+		var resp map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			t.Fatalf("non-JSON-RPC line %d on mplex mcp stdout: %v\nline=%q", lineCount, err, scanner.Text())
+		}
+		if resp["jsonrpc"] != "2.0" {
+			t.Fatalf("line %d missing jsonrpc=2.0: %v", lineCount, resp)
+		}
+	}
+	if lineCount != 4 {
+		t.Fatalf("expected exactly 4 JSON-RPC responses (notification must be silent), got %d:\n%s", lineCount, mcpOut.String())
 	}
 }

@@ -16,8 +16,12 @@ import (
 func inspectForegroundProc(ptmx *os.File, fallbackPID int) (fgCmd string, cwd string) {
 	pid := fallbackPID
 	if ptmx != nil {
-		if pgrp, err := unix.IoctlGetInt(int(ptmx.Fd()), unix.TIOCGPGRP); err == nil && pgrp > 0 {
-			pid = pgrp
+		if raw, err := ptmx.SyscallConn(); err == nil {
+			_ = raw.Control(func(fd uintptr) {
+				if pgrp, err := unix.IoctlGetInt(int(fd), unix.TIOCGPGRP); err == nil && pgrp > 0 {
+					pid = pgrp
+				}
+			})
 		}
 	}
 	if pid <= 0 {
