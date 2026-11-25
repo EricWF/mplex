@@ -55,7 +55,7 @@ function __mplex_needs_command
     set -l i 2
     while test $i -le (count $cmd)
         switch $cmd[$i]
-            case --socket --key --scrollback --replay-lines
+            case --socket --key --scrollback --replay-lines --naming
                 set i (math $i + 2)
                 continue
             case '-*'
@@ -73,7 +73,7 @@ function __mplex_using_command
     set -l i 2
     while test $i -le (count $cmd)
         switch $cmd[$i]
-            case --socket --key --scrollback --replay-lines
+            case --socket --key --scrollback --replay-lines --naming
                 set i (math $i + 2)
                 continue
             case '-*'
@@ -94,6 +94,8 @@ complete -c mplex -n __mplex_needs_command -l socket -r -F -d 'Daemon Unix socke
 complete -c mplex -n __mplex_needs_command -l key -r -d 'Switcher trigger key'
 complete -c mplex -n __mplex_needs_command -l scrollback -r -d 'Max scrollback lines per session'
 complete -c mplex -n __mplex_needs_command -l replay-lines -r -d 'Max scrollback lines replayed on switch'
+complete -c mplex -n __mplex_needs_command -l window-title -d 'Tag outer terminal window title with [session]'
+complete -c mplex -n __mplex_needs_command -l naming -r -a 'cwd numeric' -d 'Default session naming mode'
 complete -c mplex -n __mplex_needs_command -l pick -d 'Open session switcher immediately'
 complete -c mplex -n __mplex_needs_command -l nested -d 'Allow nesting mplex inside an existing session'
 complete -c mplex -n __mplex_needs_command -l version -d 'Print version and exit'
@@ -150,6 +152,7 @@ complete -c mplex -n '__mplex_using_command list ls' -l json -d 'Output sessions
 complete -c mplex -n '__mplex_using_command list ls' -l socket -r -F -d 'Daemon Unix socket path'
 
 # capture / read / logs
+complete -c mplex -n '__mplex_using_command capture read logs' -s f -l follow -d 'Stream live output continuously (read-only)'
 complete -c mplex -n '__mplex_using_command capture read logs' -l lines -r -d 'Limit output to last N lines'
 complete -c mplex -n '__mplex_using_command capture read logs' -l scrollback -d 'Include scrollback history'
 complete -c mplex -n '__mplex_using_command capture read logs' -l ansi -d 'Preserve ANSI escape sequences'
@@ -167,20 +170,17 @@ complete -c mplex -n '__mplex_using_command send write' -l socket -r -F -d 'Daem
 complete -c mplex -n '__mplex_using_command send write' -a '(__mplex_sessions)'
 
 # follow
-complete -c mplex -n '__mplex_using_command follow' -l lines -r -d 'Initial tail lines to show'
-complete -c mplex -n '__mplex_using_command follow' -l scrollback -d 'Include scrollback history'
-complete -c mplex -n '__mplex_using_command follow' -l ansi -d 'Preserve ANSI escape sequences'
-complete -c mplex -n '__mplex_using_command follow' -l json -d 'Output events as JSON'
+complete -c mplex -n '__mplex_using_command follow' -l history -d 'Emit existing screen/scrollback before live bytes'
+complete -c mplex -n '__mplex_using_command follow' -l lines -r -d 'Initial history lines to emit with --history'
 complete -c mplex -n '__mplex_using_command follow' -l socket -r -F -d 'Daemon Unix socket path'
 complete -c mplex -n '__mplex_using_command follow' -a '(__mplex_sessions)'
 
 # wait
-complete -c mplex -n '__mplex_using_command wait' -l timeout -r -d 'Maximum time to wait'
-complete -c mplex -n '__mplex_using_command wait' -l interval -r -d 'Polling interval'
-complete -c mplex -n '__mplex_using_command wait' -l regex -d 'Treat pattern as regular expression'
-complete -c mplex -n '__mplex_using_command wait' -l idle -d 'Wait until session output becomes idle'
-complete -c mplex -n '__mplex_using_command wait' -l lines -r -d 'Lines of screen/scrollback to inspect'
+complete -c mplex -n '__mplex_using_command wait' -l match -r -d 'Regex pattern to match in session output'
+complete -c mplex -n '__mplex_using_command wait' -l idle -r -d 'Wait until session output is quiet for duration (e.g. 2s)'
+complete -c mplex -n '__mplex_using_command wait' -l exit -d 'Wait until session exits'
 complete -c mplex -n '__mplex_using_command wait' -l scrollback -d 'Search scrollback as well as visible screen'
+complete -c mplex -n '__mplex_using_command wait' -l timeout -r -d 'Maximum time to wait (default 30s)'
 complete -c mplex -n '__mplex_using_command wait' -l json -d 'Output wait result as JSON'
 complete -c mplex -n '__mplex_using_command wait' -l socket -r -F -d 'Daemon Unix socket path'
 complete -c mplex -n '__mplex_using_command wait' -a '(__mplex_sessions)'
@@ -309,6 +309,8 @@ _mplex() {
         '--key=[Switcher trigger key]:key spec:' \
         '--scrollback=[Max scrollback lines per session]:lines:' \
         '--replay-lines=[Max scrollback lines replayed on switch]:lines:' \
+        '--window-title[Tag outer terminal window title with session name]' \
+        '--naming=[Default session naming mode]:mode:(cwd numeric)' \
         '--pick[Open session switcher immediately]' \
         '--nested[Allow nesting mplex inside an existing session]' \
         '--version[Print version and exit]' \
@@ -355,6 +357,7 @@ _mplex() {
                     ;;
                 capture|read|logs)
                     _arguments \
+                        '(-f --follow)'{-f,--follow}'[Stream live output continuously (read-only)]' \
                         '--lines=[Limit output to last N lines]:lines:' \
                         '--scrollback[Include scrollback history]' \
                         '--ansi[Preserve ANSI escape sequences]' \
@@ -375,25 +378,21 @@ _mplex() {
                     ;;
                 follow)
                     _arguments \
-                        '--lines=[Initial tail lines to show]:lines:' \
-                        '--scrollback[Include scrollback history]' \
-                        '--ansi[Preserve ANSI escape sequences]' \
-                        '--json[Output events as JSON]' \
+                        '--history[Emit existing screen/scrollback before live bytes]' \
+                        '--lines=[Initial history lines to emit with --history]:lines:' \
                         '--socket=[Daemon Unix socket path]:socket file:_files' \
                         '1:session:_mplex_sessions'
                     ;;
                 wait)
                     _arguments \
-                        '--timeout=[Maximum time to wait]:duration:' \
-                        '--interval=[Polling interval]:duration:' \
-                        '--regex[Treat pattern as regular expression]' \
-                        '--idle[Wait until session output becomes idle]' \
-                        '--lines=[Lines to inspect]:lines:' \
+                        '--match=[Regex pattern to match in session output]:regex:' \
+                        '--idle=[Wait until session output is quiet for duration]:duration:' \
+                        '--exit[Wait until session exits]' \
                         '--scrollback[Search scrollback as well as screen]' \
+                        '--timeout=[Maximum time to wait]:duration:' \
                         '--json[Output result as JSON]' \
                         '--socket=[Daemon Unix socket path]:socket file:_files' \
-                        '1:session:_mplex_sessions' \
-                        '2:pattern:'
+                        '1:session:_mplex_sessions'
                     ;;
                 mcp)
                     _arguments \
@@ -497,7 +496,7 @@ _mplex_completions() {
                 (( i++ ))
                 continue
                 ;;
-            --key|--scrollback|--replay-lines)
+            --key|--scrollback|--replay-lines|--naming)
                 (( i += 2 ))
                 continue
                 ;;
@@ -524,6 +523,10 @@ _mplex_completions() {
             COMPREPLY=( $(compgen -d -- "$cur") )
             return 0
             ;;
+        --naming)
+            COMPREPLY=( $(compgen -W "cwd numeric" -- "$cur") )
+            return 0
+            ;;
         --key)
             if [[ "$subcmd" == "send" || "$subcmd" == "write" ]]; then
                 COMPREPLY=( $(compgen -W "enter tab esc space bs up down left right home end pgup pgdn del ctrl-c ctrl-d ctrl-z ctrl-l" -- "$cur") )
@@ -534,7 +537,7 @@ _mplex_completions() {
             ;;
     esac
 
-    local global_flags="--socket --key --scrollback --replay-lines --pick --nested --version --help"
+    local global_flags="--socket --key --scrollback --replay-lines --window-title --naming --pick --nested --version --help"
     local commands="new attach switch list capture read logs send follow wait mcp rename kill detach save restore config completion update version help"
 
     local sessions=""
@@ -576,7 +579,7 @@ _mplex_completions() {
             flags="--json --socket"
             ;;
         capture|read|logs)
-            flags="--lines --scrollback --ansi --raw-wrap --json --socket"
+            flags="-f --follow --lines --scrollback --ansi --raw-wrap --json --socket"
             complete_sessions=1
             ;;
         send|write)
@@ -584,11 +587,11 @@ _mplex_completions() {
             complete_sessions=1
             ;;
         follow)
-            flags="--lines --scrollback --ansi --json --socket"
+            flags="--history --lines --socket"
             complete_sessions=1
             ;;
         wait)
-            flags="--timeout --interval --regex --idle --lines --scrollback --json --socket"
+            flags="--match --idle --exit --scrollback --timeout --json --socket"
             complete_sessions=1
             ;;
         mcp)

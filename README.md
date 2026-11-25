@@ -87,18 +87,24 @@ For example, in **Ghostty** (`~/.config/ghostty/config`) or **Kitty** / **WezTer
 | `Tab` | Quick-toggle to previously active session |
 | `Alt+Enter` / `Ctrl+O` | Force-create a new session (using typed query as name) |
 | `Up`/`Down` / `Ctrl+P`/`Ctrl+N` / `Ctrl+K`/`Ctrl+J` | Move selection (mouse wheel & click also work) |
+| `Alt+Up`/`Alt+Down` / `Shift+Up`/`Shift+Down` / `Ctrl+B`/`Ctrl+F` | Scroll the live preview pane through scrollback (mouse wheel over right pane also works) |
 | `Ctrl+R` | Rename selected session inline |
 | `Ctrl+X` / `Ctrl+D` | Kill selected session (with confirmation) |
 | `Ctrl+Q` / `Alt+D` | Detach cleanly (sessions keep running in background) |
 | `Esc` / `Ctrl+C` | Cancel and return seamlessly to current session (or quit when opened unattached) |
 | Trigger key (2nd tap) | Send literal trigger key to current session |
 
-## Automation & LLM-Friendly CLI
+> **Multi-window & Switcher Highlights:**
+> - **Window titles:** Outer terminal titles are tagged with `[session]` (or `[session] inner title`) so multiple OS windows stay easy to distinguish (disable with `--window-title=false`, `MPLEX_WINDOW_TITLE=0`, or `window_title = false` in `config.toml`).
+> - **Activity & bell badges:** Background sessions show live unread-output and bell indicators in the switcher and auto-refresh the preview pane while open.
+> - **Smart default names:** Unnamed sessions default to the current directory basename (`api`, `api-2`, …), or switch to legacy numeric naming via `--naming=numeric` / `MPLEX_NAMING=numeric` / `naming = "numeric"`.
 
-Every session-management command works non-interactively and supports `--json` output, so AI assistants and scripts can inspect, drive, and switch your terminal sessions without stealing your window:
+## Automation, MCP & LLM-Friendly CLI
+
+Every session-management command works non-interactively and supports `--json` output, and `mplex` ships a **built-in stdio MCP server** with zero external dependencies:
 
 ```bash
-# Structured session inventory (includes id, pid, fg_command, cwd, title, scrollback, attached)
+# Structured session inventory (includes id, pid, fg_command, cwd, title, scrollback, attached, unread_output, has_bell)
 mplex list --json
 
 # Create detached sessions with structured metadata output
@@ -107,6 +113,15 @@ mplex new api -d -c ~/projects/api --json -- npm run dev
 # Read live screen or scrollback output from any session (soft-wrapped lines joined by default)
 mplex capture api --scrollback --lines 100
 mplex capture api --json
+
+# Stream live read-only output without detaching or stealing the user's window
+mplex follow api --history
+mplex logs -f api
+
+# Wait for a regex match, idle period, or session exit (no clumsy sleep/poll loops)
+mplex wait api --match "listening on :8080" --timeout 30s --json
+mplex wait api --idle 2s --json
+mplex wait build --exit --timeout 5m --json
 
 # Send commands or special keys to a session without detaching/stealing the user's window
 mplex send api "npm test" --enter
@@ -119,3 +134,37 @@ mplex switch api --json
 mplex rename api backend --json
 mplex kill backend --json
 ```
+
+### Built-in MCP Server (`mplex mcp`)
+
+Point Claude Code, Cursor, Antigravity, or any MCP-compatible client at `mplex mcp` over stdio to expose `list_sessions`, `create_session`, `capture_session`, `send_input`, `switch_session`, `wait_session`, `rename_session`, and `kill_session` natively:
+
+```json
+{
+  "mcpServers": {
+    "mplex": {
+      "command": "mplex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+## Configuration, Completions & Workspaces
+
+```bash
+# Create & inspect ~/.config/mplex/config.toml (precedence: CLI flags > MPLEX_* env > config.toml > defaults)
+mplex config --init
+mplex config
+
+# Install shell completions with live dynamic session-name completion
+mplex completion fish > ~/.config/fish/completions/mplex.fish
+mplex completion zsh  > "${fpath[1]}/_mplex"
+mplex completion bash > ~/.local/share/bash-completion/completions/mplex
+
+# Save & restore session layouts (names + working directories + optional scrollback tail)
+mplex save work --with-scrollback
+mplex restore work
+```
+
+> **Homebrew tap (optional for maintainers):** [release.yml](.github/workflows/release.yml) includes an opt-in step (guarded on `HOMEBREW_TAP_TOKEN`) that uses `scripts/render-homebrew-formula.sh` to automatically update `Formula/mplex.rb` in `EricWF/homebrew-tap` on every release.
