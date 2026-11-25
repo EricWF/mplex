@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/EricWF/mplex/internal/client"
 	"github.com/EricWF/mplex/internal/daemon"
+	"github.com/EricWF/mplex/internal/mcp"
 	"github.com/EricWF/mplex/internal/protocol"
 	"github.com/EricWF/mplex/internal/updater"
 )
@@ -112,6 +114,15 @@ func run(args []string) error {
 
 	case "capture", "read", "logs":
 		return runCaptureCmd(socketPath, rest)
+
+	case "follow":
+		return runFollowCmd(socketPath, rest)
+
+	case "wait":
+		return runWaitCmd(socketPath, rest)
+
+	case "mcp":
+		return runMCPCmd(socketPath, rest)
 
 	case "send", "write":
 		return runSendCmd(socketPath, rest)
@@ -489,9 +500,12 @@ func runCaptureCmd(socketPath string, args []string) error {
 	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
 	lines := fs.Int("lines", 0, "limit output to the last N lines (0 = all)")
 	scrollback := fs.Bool("scrollback", false, "include scrollback history before the visible screen")
+	history := fs.Bool("history", false, "include scrollback/screen history before streaming live output (with -f)")
 	ansi := fs.Bool("ansi", false, "preserve ANSI color/style escape sequences")
 	rawWrap := fs.Bool("raw-wrap", false, "keep raw terminal row breaks instead of joining soft-wrapped lines")
 	jsonOut := fs.Bool("json", false, "output captured screen and session metadata as JSON")
+	followShort := fs.Bool("f", false, "stream live session output continuously (read-only)")
+	followLong := fs.Bool("follow", false, "stream live session output continuously (read-only)")
 
 	parseArgs, _ := reorderFlagsBeforeDash(args, map[string]bool{
 		"socket": true,
@@ -508,7 +522,14 @@ func runCaptureCmd(socketPath string, args []string) error {
 		target = envID
 	}
 	if target == "" {
-		return fmt.Errorf("usage: mplex capture <session> [--lines N] [--scrollback] [--ansi] [--json]")
+		return fmt.Errorf("usage: mplex capture <session> [--lines N] [--scrollback] [--ansi] [--follow|-f] [--json]")
+	}
+
+	if *followShort || *followLong {
+		if *jsonOut {
+			return fmt.Errorf("--json cannot be combined with --follow")
+		}
+		return followSession(socketPath, target, *scrollback || *history || *lines > 0, *lines)
 	}
 
 	rc, err := client.Dial(socketPath, nil)
@@ -520,7 +541,7 @@ func runCaptureCmd(socketPath string, args []string) error {
 	resp, err := rc.Capture(protocol.CaptureReq{
 		Target:            target,
 		Lines:             *lines,
-		IncludeScrollback: *scrollback,
+		IncludeScrollback: *scrollback || *history,
 		ANSI:              *ansi,
 		RawWrap:           *rawWrap,
 	})
@@ -537,6 +558,181 @@ func runCaptureCmd(socketPath string, args []string) error {
 		fmt.Println(resp.Text)
 	}
 	return nil
+}
+
+func runFollowCmd(socketPath string, args []string) error {
+	fs := flag.NewFlagSet("mplex follow", flag.ContinueOnError)
+	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
+	history := fs.Bool("history", false, "print existing screen/scrollback history before streaming live bytes")
+	lines := fs.Int("lines", 0, "limit initial history snapshot to the last N lines (implies --history when > 0)")
+
+	parseArgs, _ := reorderFlagsBeforeDash(args, map[string]bool{
+		"socket": true,
+		"lines":  true,
+	})
+	if err := fs.Parse(parseArgs); err != nil {
+		return err
+	}
+
+	target := ""
+	if fs.NArg() > 0 {
+		target = fs.Arg(0)
+	} else if envID := os.Getenv("MPLEX_SESSION_ID"); envID != "" {
+		target = envID
+	}
+	if target == "" {
+		return fmt.Errorf("usage: mplex follow <session> [--history] [--lines N]")
+	}
+
+	return followSession(socketPath, target, *history || *lines > 0, *lines)
+}
+
+func followSession(socketPath, target string, includeHistory bool, lines int) error {
+	rc, err := client.Dial(socketPath, os.Stdout)
+	if err != nil {
+		return fmt.Errorf("daemon not running: %w", err)
+	}
+	defer rc.Close()
+
+	if _, err := rc.Follow(protocol.FollowReq{
+		Target:         target,
+		IncludeHistory: includeHistory,
+		Lines:          lines,
+	}); err != nil {
+		return err
+	}
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case <-sigCh:
+		return nil
+	case <-rc.SessionExitedCh:
+		return nil
+	case <-rc.Done():
+		return nil
+	}
+}
+
+func runWaitCmd(socketPath string, args []string) error {
+	fs := flag.NewFlagSet("mplex wait", flag.ContinueOnError)
+	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
+	match := fs.String("match", "", "wait until captured text matches this regular expression")
+	idle := fs.Duration("idle", 0, "wait until session has no new activity for this duration (e.g. 2s)")
+	exit := fs.Bool("exit", false, "wait until session exits")
+	scrollback := fs.Bool("scrollback", false, "include scrollback history when checking --match")
+	timeout := fs.Duration("timeout", client.DefaultWaitTimeout, "maximum duration to wait")
+	jsonOut := fs.Bool("json", false, "output structured wait result as JSON")
+
+	parseArgs, _ := reorderFlagsBeforeDash(args, map[string]bool{
+		"socket":  true,
+		"match":   true,
+		"idle":    true,
+		"timeout": true,
+	})
+	if err := fs.Parse(parseArgs); err != nil {
+		return err
+	}
+
+	target := ""
+	if fs.NArg() > 0 {
+		target = fs.Arg(0)
+	} else if envID := os.Getenv("MPLEX_SESSION_ID"); envID != "" {
+		target = envID
+	}
+	if target == "" {
+		return fmt.Errorf("usage: mplex wait <session> [--match <regex>] [--idle <duration>] [--exit] [--scrollback] [--timeout <duration>] [--json]")
+	}
+	if *idle < 0 {
+		return fmt.Errorf("--idle must be a positive duration")
+	}
+	if *timeout <= 0 {
+		return fmt.Errorf("--timeout must be a positive duration")
+	}
+	if *match == "" && *idle == 0 && !*exit {
+		return fmt.Errorf("usage: mplex wait <session> requires at least one condition (--match, --idle, or --exit)")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	rc, err := client.Dial(socketPath, nil)
+	if err != nil {
+		if *exit {
+			res := client.WaitResult{
+				Matched: true,
+				Reason:  "exit",
+			}
+			if *jsonOut {
+				return writeJSON(res)
+			}
+			fmt.Printf("Session %q exited\n", target)
+			return nil
+		}
+		return fmt.Errorf("daemon not running: %w", err)
+	}
+	defer rc.Close()
+
+	res, err := client.Wait(ctx, rc, client.WaitOptions{
+		Target:            target,
+		Match:             *match,
+		Idle:              *idle,
+		Exit:              *exit,
+		IncludeScrollback: *scrollback,
+		Timeout:           *timeout,
+	})
+	if err != nil {
+		if *jsonOut && errors.Is(err, client.ErrWaitTimeout) {
+			_ = writeJSON(res)
+		}
+		return err
+	}
+
+	if *jsonOut {
+		return writeJSON(res)
+	}
+	switch res.Reason {
+	case "match":
+		if res.MatchLine != "" {
+			fmt.Println(res.MatchLine)
+		}
+	case "idle":
+		name := target
+		if res.Session != nil && res.Session.Name != "" {
+			name = res.Session.Name
+		}
+		fmt.Printf("Session %q is idle\n", name)
+	case "exit":
+		name := target
+		if res.Session != nil && res.Session.Name != "" {
+			name = res.Session.Name
+		}
+		fmt.Printf("Session %q exited\n", name)
+	}
+	return nil
+}
+
+func runMCPCmd(socketPath string, args []string) error {
+	fs := flag.NewFlagSet("mplex mcp", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
+	parseArgs, _ := reorderFlagsBeforeDash(args, map[string]bool{"socket": true})
+	if err := fs.Parse(parseArgs); err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	srv := mcp.NewServer(mcp.Options{
+		SocketPath: socketPath,
+		Version:    currentVersion(),
+		ErrOut:     os.Stderr,
+		Scrollback: envInt("MPLEX_SCROLLBACK", 10000),
+	})
+	return srv.ServeContext(ctx, os.Stdin, os.Stdout)
 }
 
 type multiStringFlag []string
@@ -586,7 +782,7 @@ func runSendCmd(socketPath string, args []string) error {
 		payload.WriteString(strings.Join(textParts, " "))
 	}
 	for _, ks := range keys {
-		b, err := parseSendKey(ks)
+		b, err := client.ParseSendKey(ks)
 		if err != nil {
 			return err
 		}
@@ -614,84 +810,6 @@ func runSendCmd(socketPath string, args []string) error {
 	}
 	fmt.Printf("Sent %d bytes to session %q\n", resp.Bytes, resp.Session.Name)
 	return nil
-}
-
-func parseSendKey(spec string) ([]byte, error) {
-	s := strings.TrimSpace(strings.ToLower(spec))
-	s = strings.ReplaceAll(s, "+", "-")
-	switch s {
-	case "enter", "return", "cr":
-		return []byte{'\r'}, nil
-	case "lf", "newline":
-		return []byte{'\n'}, nil
-	case "tab":
-		return []byte{'\t'}, nil
-	case "esc", "escape":
-		return []byte{0x1b}, nil
-	case "space", "spc":
-		return []byte{' '}, nil
-	case "bs", "backspace", "bspace":
-		return []byte{0x7f}, nil
-	case "up":
-		return []byte("\x1b[A"), nil
-	case "down":
-		return []byte("\x1b[B"), nil
-	case "right":
-		return []byte("\x1b[C"), nil
-	case "left":
-		return []byte("\x1b[D"), nil
-	case "home":
-		return []byte("\x1b[H"), nil
-	case "end":
-		return []byte("\x1b[F"), nil
-	case "pgup", "pageup":
-		return []byte("\x1b[5~"), nil
-	case "pgdn", "pagedown":
-		return []byte("\x1b[6~"), nil
-	case "del", "delete":
-		return []byte("\x1b[3~"), nil
-	}
-
-	if strings.HasPrefix(s, "^") && len(s) == 2 {
-		s = "ctrl-" + s[1:]
-	} else if strings.HasPrefix(s, "c-") && len(s) >= 3 {
-		s = "ctrl-" + s[2:]
-	} else if strings.HasPrefix(s, "m-") && len(s) >= 3 {
-		s = "alt-" + s[2:]
-	}
-
-	if strings.HasPrefix(s, "ctrl-") {
-		k := strings.TrimPrefix(s, "ctrl-")
-		switch k {
-		case "space", "spc", "@":
-			return []byte{0x00}, nil
-		case "[":
-			return []byte{0x1b}, nil
-		case "\\", "backslash":
-			return []byte{0x1c}, nil
-		case "]":
-			return []byte{0x1d}, nil
-		case "^", "6":
-			return []byte{0x1e}, nil
-		case "_", "/":
-			return []byte{0x1f}, nil
-		default:
-			if len(k) == 1 && k[0] >= 'a' && k[0] <= 'z' {
-				return []byte{k[0] - 'a' + 1}, nil
-			}
-		}
-		return nil, fmt.Errorf("unsupported key %q", spec)
-	}
-
-	if strings.HasPrefix(s, "alt-") {
-		k := strings.TrimPrefix(s, "alt-")
-		if len(k) == 1 && k[0] >= 0x20 && k[0] <= 0x7e {
-			return []byte{0x1b, k[0]}, nil
-		}
-		return nil, fmt.Errorf("unsupported key %q", spec)
-	}
-
-	return nil, fmt.Errorf("unknown key %q (try enter, tab, esc, up, down, ctrl-c, ctrl-d, ...)", spec)
 }
 
 func runUpdateCmd(socketPath string, args []string) error {
@@ -990,8 +1108,11 @@ Usage:
   mplex attach [name] [--create] [--pick]   Attach to an existing session (switches outer window if inside mplex)
   mplex switch [name] [--client id] [--json] Open switcher or switch an active window directly to <name>
   mplex list [--json]                       List active sessions
-  mplex capture <name> [flags]              Read a session's screen or scrollback (--lines, --scrollback, --ansi, --json)
+  mplex capture <name> [flags]              Read a session's screen/scrollback (--lines, --scrollback, --ansi, -f/--follow, --json)
+  mplex follow <name> [flags]               Stream live read-only output from a session (--history, --lines)
+  mplex wait <name> [flags]                 Wait for a session condition (--match, --idle, --exit, --scrollback, --timeout, --json)
   mplex send <name> [text...] [flags]       Send input/keys to a session without attaching (--enter, --key, --stdin, --json)
+  mplex mcp                                 Run built-in stdio MCP server (JSON-RPC 2.0) for LLM/agent integrations
   mplex rename <old> <new> [--json]         Rename a session
   mplex kill <name> | --all [--json]        Kill one or all sessions
   mplex detach [--client id] [--json]       Detach an active client

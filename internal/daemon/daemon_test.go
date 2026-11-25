@@ -1,6 +1,7 @@
 package daemon_test
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -248,4 +249,167 @@ func TestEndToEndDaemonSwitchRestoresScrollbackAndAltScreenModes(t *testing.T) {
 		t.Fatalf("kill all failed: killed=%v err=%v", killed, err)
 	}
 	fmt.Printf("end-to-end daemon test verified: scrollback, alt-screen, modes, pause/restore, out-of-band switcher\n")
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestFollowReadOnlyDoesNotDetachActiveClient(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "mplex-flw-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "m.sock")
+
+	d := daemon.New(sock)
+	go func() {
+		_ = d.Start()
+	}()
+	defer d.Close()
+
+	// Connect interactive client A.
+	var active *client.RPCConn
+	outer := newOuterTermSink(20, 80)
+	waitFor(t, 2*time.Second, "daemon socket", func() bool {
+		c, err := client.Dial(sock, outer)
+		if err != nil {
+			return false
+		}
+		active = c
+		return true
+	})
+	defer active.Close()
+
+	sz := protocol.WinSize{Rows: 20, Cols: 80}
+	hello, err := active.Hello(protocol.HelloReq{Size: sz, Term: "xterm-256color", Interactive: true})
+	if err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+
+	sess, err := active.Create(protocol.CreateReq{
+		Name: "live",
+		Cmd:  []string{"/bin/sh"},
+		Size: sz,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := active.Attach(protocol.AttachReq{Target: sess.ID, Size: sz, ReplayLines: 500}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	// Emit output before followers join.
+	if err := active.SendStdin([]byte("echo BEFORE_FOLLOW_HISTORY\n")); err != nil {
+		t.Fatalf("SendStdin: %v", err)
+	}
+	waitFor(t, 3*time.Second, "BEFORE_FOLLOW_HISTORY on active client", func() bool {
+		return outer.screenContains("BEFORE_FOLLOW_HISTORY")
+	})
+
+	// Follower 1 joins WITH history.
+	bufHist := &syncBuffer{}
+	followerHist, err := client.Dial(sock, bufHist)
+	if err != nil {
+		t.Fatalf("dial followerHist: %v", err)
+	}
+	defer followerHist.Close()
+
+	resp1, err := followerHist.Follow(protocol.FollowReq{
+		Target:         "live",
+		IncludeHistory: true,
+		Lines:          50,
+	})
+	if err != nil {
+		t.Fatalf("Follow (history): %v", err)
+	}
+	if !resp1.Session.Attached || resp1.Session.AttachedBy != hello.ClientID {
+		t.Fatalf("expected active client %q to remain attached, got %+v", hello.ClientID, resp1.Session)
+	}
+
+	// Follower 2 joins WITHOUT history.
+	bufLive := &syncBuffer{}
+	followerLive, err := client.Dial(sock, bufLive)
+	if err != nil {
+		t.Fatalf("dial followerLive: %v", err)
+	}
+	defer followerLive.Close()
+
+	if _, err := followerLive.Follow(protocol.FollowReq{
+		Target:         "live",
+		IncludeHistory: false,
+	}); err != nil {
+		t.Fatalf("Follow (live only): %v", err)
+	}
+
+	// Follower 1 should receive the history snapshot; active client must NOT be detached.
+	waitFor(t, 2*time.Second, "followerHist receives initial history", func() bool {
+		return strings.Contains(bufHist.String(), "BEFORE_FOLLOW_HISTORY")
+	})
+	if strings.Contains(bufLive.String(), "BEFORE_FOLLOW_HISTORY") {
+		t.Fatalf("follower without IncludeHistory unexpectedly received old history: %q", bufLive.String())
+	}
+	select {
+	case ev := <-active.DetachedCh:
+		t.Fatalf("active client was detached by follower: %+v", ev)
+	default:
+	}
+
+	// Broadcast live output -> active client AND both followers receive it.
+	if err := active.SendStdin([]byte("echo LIVE_BROADCAST_OK\n")); err != nil {
+		t.Fatalf("SendStdin live: %v", err)
+	}
+	waitFor(t, 3*time.Second, "active client receives LIVE_BROADCAST_OK", func() bool {
+		return outer.screenContains("LIVE_BROADCAST_OK")
+	})
+	waitFor(t, 3*time.Second, "followerHist receives LIVE_BROADCAST_OK", func() bool {
+		return strings.Contains(bufHist.String(), "LIVE_BROADCAST_OK")
+	})
+	waitFor(t, 3*time.Second, "followerLive receives LIVE_BROADCAST_OK", func() bool {
+		return strings.Contains(bufLive.String(), "LIVE_BROADCAST_OK")
+	})
+
+	// Disconnect follower 1 (triggers Unfollow cleanup) and verify streaming continues cleanly.
+	_ = followerHist.Close()
+	if err := active.SendStdin([]byte("echo AFTER_UNFOLLOW_OK\n")); err != nil {
+		t.Fatalf("SendStdin after unfollow: %v", err)
+	}
+	waitFor(t, 3*time.Second, "followerLive receives AFTER_UNFOLLOW_OK", func() bool {
+		return strings.Contains(bufLive.String(), "AFTER_UNFOLLOW_OK")
+	})
+
+	// Exit the session -> BOTH active client and followerLive receive MsgSessionExited!
+	if err := active.SendStdin([]byte("exit 0\n")); err != nil {
+		t.Fatalf("SendStdin exit: %v", err)
+	}
+	select {
+	case ev := <-active.SessionExitedCh:
+		if ev.SessionID != sess.ID {
+			t.Fatalf("active SessionExitedCh id=%q, want %q", ev.SessionID, sess.ID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("active client did not receive MsgSessionExited")
+	}
+	select {
+	case ev := <-followerLive.SessionExitedCh:
+		if ev.SessionID != sess.ID {
+			t.Fatalf("followerLive SessionExitedCh id=%q, want %q", ev.SessionID, sess.ID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("followerLive did not receive MsgSessionExited")
+	}
 }

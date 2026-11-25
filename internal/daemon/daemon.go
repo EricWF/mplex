@@ -234,6 +234,10 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		if sess := c.currentSession(); sess != nil {
 			sess.Detach(c)
 		}
+		if sess := c.currentFollowed(); sess != nil {
+			sess.Unfollow(c)
+			c.clearFollowed(sess)
+		}
 		d.mu.Lock()
 		delete(d.clients, c.id)
 		shouldCheck := d.AutoExitOnEmpty && d.hadSession && len(d.sessions) == 0 && len(d.clients) == 0
@@ -525,6 +529,29 @@ func (d *Daemon) dispatchFrame(c *ClientConn, frame protocol.Frame) {
 			Session: sess.Info(),
 			Bytes:   len(req.Data),
 		})
+
+	case protocol.MsgFollowReq:
+		var req protocol.FollowReq
+		if err := protocol.DecodeJSON(frame.Payload, &req); err != nil {
+			c.enqueueJSON(protocol.MsgFollowResp, protocol.FollowResp{Error: err.Error()})
+			return
+		}
+		sess := d.findSession(req.Target)
+		if sess == nil {
+			c.enqueueJSON(protocol.MsgFollowResp, protocol.FollowResp{
+				Error: fmt.Sprintf("session %q not found", req.Target),
+			})
+			return
+		}
+		if prev := c.currentFollowed(); prev != nil && prev != sess {
+			prev.Unfollow(c)
+		}
+		c.setFollowed(sess)
+		if _, err := sess.Follow(c, req); err != nil {
+			c.clearFollowed(sess)
+			c.enqueueJSON(protocol.MsgFollowResp, protocol.FollowResp{Error: err.Error()})
+			return
+		}
 	}
 }
 
@@ -571,6 +598,7 @@ type ClientConn struct {
 
 	stateMu     sync.Mutex
 	sess        *Session
+	followed    *Session
 	interactive bool
 	size        protocol.WinSize
 	lastAct     time.Time
@@ -646,6 +674,28 @@ func (c *ClientConn) clearSession(s *Session) {
 	c.stateMu.Lock()
 	if c.sess == s {
 		c.sess = nil
+	}
+	c.stateMu.Unlock()
+}
+
+func (c *ClientConn) currentFollowed() *Session {
+	c.stateMu.Lock()
+	s := c.followed
+	c.stateMu.Unlock()
+	return s
+}
+
+func (c *ClientConn) setFollowed(s *Session) {
+	c.stateMu.Lock()
+	c.followed = s
+	c.lastAct = time.Now()
+	c.stateMu.Unlock()
+}
+
+func (c *ClientConn) clearFollowed(s *Session) {
+	c.stateMu.Lock()
+	if c.followed == s {
+		c.followed = nil
 	}
 	c.stateMu.Unlock()
 }

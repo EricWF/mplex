@@ -33,6 +33,7 @@ type Session struct {
 	vt              *vt.Terminal
 	size            protocol.WinSize
 	client          *ClientConn
+	followers       map[*ClientConn]struct{}
 	paused          bool
 	pausedGen       uint64
 	wasInAltAtPause bool
@@ -42,7 +43,9 @@ type Session struct {
 
 	queryReplyCh chan []byte
 	done         chan struct{}
+	waitDone     chan struct{}
 	closeOnce    sync.Once
+	killOnce     sync.Once
 }
 
 func newSession(d *Daemon, id, name string, req protocol.CreateReq, socketPath string) (*Session, error) {
@@ -115,9 +118,11 @@ func newSession(d *Daemon, id, name string, req protocol.CreateReq, socketPath s
 		name:         name,
 		vt:           vt.New(rows, cols, scrollback),
 		size:         protocol.WinSize{Rows: uint16(rows), Cols: uint16(cols), XPixel: req.Size.XPixel, YPixel: req.Size.YPixel},
+		followers:    make(map[*ClientConn]struct{}),
 		lastActiveAt: now,
 		queryReplyCh: make(chan []byte, 64),
 		done:         make(chan struct{}),
+		waitDone:     make(chan struct{}),
 	}
 
 	go s.queryReplyLoop()
@@ -199,6 +204,9 @@ func (s *Session) readLoop() {
 			if client != nil && !paused {
 				client.enqueueFrame(protocol.MsgStdout, chunk)
 			}
+			for f := range s.followers {
+				f.enqueueFrame(protocol.MsgStdout, chunk)
+			}
 			s.mu.Unlock()
 		}
 		if err != nil {
@@ -219,6 +227,7 @@ func (s *Session) readLoop() {
 			exitCode = 1
 		}
 	}
+	close(s.waitDone)
 
 	s.closeOnce.Do(func() {
 		close(s.done)
@@ -231,15 +240,25 @@ func (s *Session) readLoop() {
 	client := s.client
 	name := s.name
 	s.client = nil
+	followers := make([]*ClientConn, 0, len(s.followers))
+	for f := range s.followers {
+		followers = append(followers, f)
+	}
+	clear(s.followers)
 	s.mu.Unlock()
 
+	exitEv := protocol.SessionExitedEvent{
+		SessionID:   s.id,
+		SessionName: name,
+		ExitCode:    exitCode,
+	}
 	if client != nil {
 		client.clearSession(s)
-		client.enqueueJSON(protocol.MsgSessionExited, protocol.SessionExitedEvent{
-			SessionID:   s.id,
-			SessionName: name,
-			ExitCode:    exitCode,
-		})
+		client.enqueueJSON(protocol.MsgSessionExited, exitEv)
+	}
+	for _, f := range followers {
+		f.clearFollowed(s)
+		f.enqueueJSON(protocol.MsgSessionExited, exitEv)
 	}
 
 	s.daemon.removeSession(s.id)
@@ -338,6 +357,53 @@ func (s *Session) Detach(c *ClientConn) {
 		s.client = nil
 		s.paused = false
 	}
+	s.mu.Unlock()
+}
+
+// Follow registers c as a read-only live follower of this session without
+// detaching, resizing, or otherwise affecting any attached interactive client.
+// MsgFollowResp (and an optional initial history snapshot) are enqueued
+// atomically under s.mu strictly before any subsequent live MsgStdout frames.
+func (s *Session) Follow(c *ClientConn, req protocol.FollowReq) (protocol.SessionInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.exited {
+		return protocol.SessionInfo{}, errors.New("session has exited")
+	}
+	if s.followers == nil {
+		s.followers = make(map[*ClientConn]struct{})
+	}
+	s.followers[c] = struct{}{}
+	info := s.infoLocked()
+
+	c.enqueueJSON(protocol.MsgFollowResp, protocol.FollowResp{
+		Session: info,
+	})
+
+	if req.IncludeHistory {
+		lines := s.vt.Capture(vt.CaptureOptions{
+			IncludeScrollback: true,
+			ANSI:              true,
+			JoinWrapped:       true,
+			MaxLines:          req.Lines,
+		})
+		for len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		if len(lines) > 0 {
+			snapshot := strings.Join(lines, "\n") + "\n"
+			c.enqueueFrame(protocol.MsgStdout, []byte(snapshot))
+		}
+	}
+
+	return info, nil
+}
+
+// Unfollow removes c from this session's read-only followers.
+func (s *Session) Unfollow(c *ClientConn) {
+	s.mu.Lock()
+	delete(s.followers, c)
 	s.mu.Unlock()
 }
 
@@ -474,12 +540,44 @@ func (s *Session) Rename(newName string) {
 	s.mu.Unlock()
 }
 
-// Kill terminates the session's process group cleanly.
+// Kill terminates the session's process group cleanly, escalating from SIGHUP
+// to SIGTERM and SIGKILL if the process ignores hangup signals.
 func (s *Session) Kill() {
 	if s.cmd != nil && s.cmd.Process != nil {
+		proc := s.cmd.Process
+		pid := proc.Pid
 		// Send SIGHUP to the entire foreground/session process group.
-		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGHUP)
-		_ = s.cmd.Process.Signal(syscall.SIGHUP)
+		_ = syscall.Kill(-pid, syscall.SIGHUP)
+		_ = proc.Signal(syscall.SIGHUP)
+
+		s.killOnce.Do(func() {
+			go func() {
+				select {
+				case <-s.waitDone:
+					return
+				case <-time.After(100 * time.Millisecond):
+					select {
+					case <-s.waitDone:
+						return
+					default:
+					}
+					_ = syscall.Kill(-pid, syscall.SIGTERM)
+					_ = proc.Signal(syscall.SIGTERM)
+				}
+				select {
+				case <-s.waitDone:
+					return
+				case <-time.After(300 * time.Millisecond):
+					select {
+					case <-s.waitDone:
+						return
+					default:
+					}
+					_ = syscall.Kill(-pid, syscall.SIGKILL)
+					_ = proc.Signal(syscall.SIGKILL)
+				}
+			}()
+		})
 	}
 	s.closeOnce.Do(func() {
 		close(s.done)

@@ -49,6 +49,8 @@ const (
 	MsgSendReq             byte = 37
 	MsgSendResp            byte = 38
 	MsgSwitchSession       byte = 39
+	MsgFollowReq           byte = 40
+	MsgFollowResp          byte = 41
 )
 
 // MaxFrameSize guards against malformed frames (64 MiB allows huge scrollback replays).
@@ -340,5 +342,16 @@ type SendReq struct {
 type SendResp struct {
 	Session SessionInfo `json:"session"`
 	Bytes   int         `json:"bytes"`
+	Error   string      `json:"error,omitempty"`
+}
+
+type FollowReq struct {
+	Target         string `json:"target"`
+	IncludeHistory bool   `json:"include_history,omitempty"`
+	Lines          int    `json:"lines,omitempty"`
+}
+
+type FollowResp struct {
+	Session SessionInfo `json:"session"`
 	Error   string      `json:"error,omitempty"`
 }
