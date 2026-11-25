@@ -53,6 +53,11 @@ func run(args []string) error {
 	}
 	scrollback := envInt("MPLEX_SCROLLBACK", 10000)
 	replayLines := envInt("MPLEX_REPLAY_LINES", 10000)
+	windowTitle := envBool("MPLEX_WINDOW_TITLE", true)
+	namingMode := os.Getenv("MPLEX_NAMING")
+	if namingMode == "" {
+		namingMode = "cwd"
+	}
 
 	// Parse leading global flags before subcommand.
 	fs := flag.NewFlagSet("mplex", flag.ContinueOnError)
@@ -61,6 +66,8 @@ func run(args []string) error {
 	fs.StringVar(&keySpec, "key", keySpec, "switcher trigger key (e.g. ctrl-\\, ctrl-space, alt-s, none)")
 	fs.IntVar(&scrollback, "scrollback", scrollback, "max scrollback lines kept per session")
 	fs.IntVar(&replayLines, "replay-lines", replayLines, "max scrollback lines replayed on switch")
+	fs.BoolVar(&windowTitle, "window-title", windowTitle, "tag outer terminal window title with [session] name")
+	fs.StringVar(&namingMode, "naming", namingMode, "default session naming mode (cwd or numeric)")
 	openPicker := fs.Bool("pick", false, "open session switcher immediately")
 	nested := fs.Bool("nested", false, "allow nesting mplex inside an existing mplex session")
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -74,6 +81,11 @@ func run(args []string) error {
 	if *showVersion {
 		fmt.Printf("mplex %s\n", currentVersion())
 		return nil
+	}
+	var err error
+	namingMode, err = normalizeNamingMode(namingMode)
+	if err != nil {
+		return err
 	}
 
 	rest := fs.Args()
@@ -102,13 +114,13 @@ func run(args []string) error {
 		return runListCmd(socketPath, rest)
 
 	case "new", "n":
-		return runNewCmd(socketPath, keySpec, scrollback, replayLines, rest)
+		return runNewCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, rest)
 
 	case "attach", "a":
-		return runAttachCmd(socketPath, keySpec, scrollback, replayLines, *nested, rest)
+		return runAttachCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, *nested, rest)
 
 	case "switch", "pick", "s":
-		return runSwitchCmd(socketPath, keySpec, scrollback, replayLines, rest)
+		return runSwitchCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, rest)
 
 	case "capture", "read", "logs":
 		return runCaptureCmd(socketPath, rest)
@@ -129,7 +141,7 @@ func run(args []string) error {
 		// If already running inside an mplex session on the same socket, trigger
 		// the switcher on the outer client instead of accidentally nesting!
 		if !*nested && os.Getenv("MPLEX_SESSION") != "" && os.Getenv("MPLEX_SOCKET") == socketPath {
-			return runSwitchCmd(socketPath, keySpec, scrollback, replayLines, nil)
+			return runSwitchCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, nil)
 		}
 		maybePromptUpdateAndReexec(socketPath)
 		trig, err := client.ParseTriggerKey(keySpec)
@@ -142,13 +154,15 @@ func run(args []string) error {
 			OpenPicker:  *openPicker,
 			Scrollback:  scrollback,
 			ReplayLines: replayLines,
+			WindowTitle: windowTitle,
+			NamingMode:  namingMode,
 		})
 
 	default:
 		// Shorthand: `mplex <name>` attaches to (or creates) session <name>.
 		// Inside an existing mplex session, switch the outer window directly instead of nesting.
 		if !*nested && os.Getenv("MPLEX_SESSION") != "" && os.Getenv("MPLEX_SOCKET") == socketPath {
-			return switchInsideMplex(socketPath, sub, true, scrollback)
+			return switchInsideMplex(socketPath, sub, true, scrollback, namingMode)
 		}
 		maybePromptUpdateAndReexec(socketPath)
 		trig, err := client.ParseTriggerKey(keySpec)
@@ -162,6 +176,8 @@ func run(args []string) error {
 			CreateIfMissing: true,
 			Scrollback:      scrollback,
 			ReplayLines:     replayLines,
+			WindowTitle:     windowTitle,
+			NamingMode:      namingMode,
 		})
 	}
 }
@@ -239,10 +255,12 @@ func runListCmd(socketPath string, args []string) error {
 	return tw.Flush()
 }
 
-func runNewCmd(socketPath, keySpec string, scrollback, replayLines int, args []string) error {
+func runNewCmd(socketPath, keySpec, namingMode string, scrollback, replayLines int, windowTitle bool, args []string) error {
 	fs := flag.NewFlagSet("mplex new", flag.ContinueOnError)
 	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
 	fs.StringVar(&keySpec, "key", keySpec, "switcher trigger key")
+	fs.StringVar(&namingMode, "naming", namingMode, "default session naming mode (cwd or numeric)")
+	fs.BoolVar(&windowTitle, "window-title", windowTitle, "tag outer terminal window title with [session] name")
 	detached := fs.Bool("d", false, "create session detached without attaching")
 	cwd := fs.String("c", "", "starting directory for the new session")
 	jsonOut := fs.Bool("json", false, "create detached and output session metadata as JSON")
@@ -252,9 +270,15 @@ func runNewCmd(socketPath, keySpec string, scrollback, replayLines int, args []s
 	parseArgs, afterDash := reorderFlagsBeforeDash(args, map[string]bool{
 		"socket": true,
 		"key":    true,
+		"naming": true,
 		"c":      true,
 	})
 	if err := fs.Parse(parseArgs); err != nil {
+		return err
+	}
+	var err error
+	namingMode, err = normalizeNamingMode(namingMode)
+	if err != nil {
 		return err
 	}
 
@@ -291,6 +315,7 @@ func runNewCmd(socketPath, keySpec string, scrollback, replayLines int, args []s
 			Env:        os.Environ(),
 			Size:       protocol.WinSize{Rows: 24, Cols: 80},
 			Scrollback: scrollback,
+			NamingMode: namingMode,
 		})
 		if err != nil {
 			return err
@@ -319,13 +344,16 @@ func runNewCmd(socketPath, keySpec string, scrollback, replayLines int, args []s
 		CreateCmd:   cmdArgs,
 		Scrollback:  scrollback,
 		ReplayLines: replayLines,
+		WindowTitle: windowTitle,
+		NamingMode:  namingMode,
 	})
 }
 
-func runAttachCmd(socketPath, keySpec string, scrollback, replayLines int, nested bool, args []string) error {
+func runAttachCmd(socketPath, keySpec, namingMode string, scrollback, replayLines int, windowTitle, nested bool, args []string) error {
 	fs := flag.NewFlagSet("mplex attach", flag.ContinueOnError)
 	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
 	fs.StringVar(&keySpec, "key", keySpec, "switcher trigger key")
+	fs.BoolVar(&windowTitle, "window-title", windowTitle, "tag outer terminal window title with [session] name")
 	create := fs.Bool("create", false, "create the session if it does not exist")
 	pick := fs.Bool("pick", false, "open session switcher")
 
@@ -346,9 +374,9 @@ func runAttachCmd(socketPath, keySpec string, scrollback, replayLines int, neste
 	// directly instead of nesting mplex inside mplex.
 	if !nested && os.Getenv("MPLEX_SESSION") != "" && os.Getenv("MPLEX_SOCKET") == socketPath {
 		if *pick || target == "" {
-			return runSwitchCmd(socketPath, keySpec, scrollback, replayLines, nil)
+			return runSwitchCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, nil)
 		}
-		return switchInsideMplex(socketPath, target, *create, scrollback)
+		return switchInsideMplex(socketPath, target, *create, scrollback, namingMode)
 	}
 
 	maybePromptUpdateAndReexec(socketPath)
@@ -366,10 +394,12 @@ func runAttachCmd(socketPath, keySpec string, scrollback, replayLines int, neste
 		OpenPicker:      *pick,
 		Scrollback:      scrollback,
 		ReplayLines:     replayLines,
+		WindowTitle:     windowTitle,
+		NamingMode:      namingMode,
 	})
 }
 
-func switchInsideMplex(socketPath, target string, createIfMissing bool, scrollback int) error {
+func switchInsideMplex(socketPath, target string, createIfMissing bool, scrollback int, namingMode string) error {
 	rc, err := client.Dial(socketPath, nil)
 	if err != nil {
 		return fmt.Errorf("daemon not running: %w", err)
@@ -389,6 +419,7 @@ func switchInsideMplex(socketPath, target string, createIfMissing bool, scrollba
 			Env:        os.Environ(),
 			Size:       protocol.WinSize{Rows: 24, Cols: 80},
 			Scrollback: scrollback,
+			NamingMode: namingMode,
 		})
 		if createErr != nil {
 			return createErr
@@ -399,9 +430,10 @@ func switchInsideMplex(socketPath, target string, createIfMissing bool, scrollba
 	return err
 }
 
-func runSwitchCmd(socketPath, keySpec string, scrollback, replayLines int, args []string) error {
+func runSwitchCmd(socketPath, keySpec, namingMode string, scrollback, replayLines int, windowTitle bool, args []string) error {
 	fs := flag.NewFlagSet("mplex switch", flag.ContinueOnError)
 	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
+	fs.BoolVar(&windowTitle, "window-title", windowTitle, "tag outer terminal window title with [session] name")
 	clientID := fs.String("client", "", "specific client ID to target")
 	jsonOut := fs.Bool("json", false, "output result as JSON")
 
@@ -473,6 +505,8 @@ func runSwitchCmd(socketPath, keySpec string, scrollback, replayLines int, args 
 			InitialTarget: target,
 			Scrollback:    scrollback,
 			ReplayLines:   replayLines,
+			WindowTitle:   windowTitle,
+			NamingMode:    namingMode,
 		})
 	}
 	return client.RunInteractive(client.Options{
@@ -481,6 +515,8 @@ func runSwitchCmd(socketPath, keySpec string, scrollback, replayLines int, args 
 		OpenPicker:  true,
 		Scrollback:  scrollback,
 		ReplayLines: replayLines,
+		WindowTitle: windowTitle,
+		NamingMode:  namingMode,
 	})
 }
 
@@ -961,6 +997,31 @@ func envInt(name string, def int) int {
 	return def
 }
 
+func envBool(name string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
+func normalizeNamingMode(v string) (string, error) {
+	m := strings.ToLower(strings.TrimSpace(v))
+	if m == "" {
+		return "cwd", nil
+	}
+	switch m {
+	case "cwd", "numeric":
+		return m, nil
+	default:
+		return "", fmt.Errorf("invalid --naming mode %q (expected \"cwd\" or \"numeric\")", v)
+	}
+}
+
 func formatSince(t time.Time) string {
 	if t.IsZero() {
 		return "-"
@@ -1006,12 +1067,15 @@ Flags & Environment:
   --socket <path>         Daemon Unix socket path (env: MPLEX_SOCKET)
   --scrollback <lines>    Max scrollback lines tracked per session (default: 10000)
   --replay-lines <lines>  Max scrollback lines replayed on switch (default: 10000)
+  --window-title          Tag outer terminal window title with [session] (default: true, env: MPLEX_WINDOW_TITLE)
+  --naming <mode>         Default session naming mode: cwd or numeric (default: cwd, env: MPLEX_NAMING)
   MPLEX_NO_UPDATE_CHECK=1 Disable automatic GitHub release check prompt on startup
 
 Switcher Keys:
   Type to fuzzy-filter    Enter: switch / create     Tab: toggle last session
   Up/Down / Ctrl+P/N      Alt+Enter / Ctrl+O: new    Ctrl+R: rename
   Ctrl+X: kill            Ctrl+Q: detach             Esc: cancel / quit
+  Alt/Shift+Up/Down / Ctrl+B/F / Mouse wheel: scroll preview pane
   Press trigger key twice to send the literal key to your session.
 `)
 }

@@ -34,6 +34,9 @@ type RPCConn struct {
 	outWriter              io.Writer
 	suppressOutput         atomic.Bool
 	droppedWhileSuppressed atomic.Bool
+	windowTitleEnabled     atomic.Bool
+	titleSessionName       string
+	titleInner             string
 
 	OpenSwitcherCh  chan protocol.OpenSwitcherEvent
 	SwitchSessionCh chan protocol.SwitchSessionEvent
@@ -126,6 +129,26 @@ func (rc *RPCConn) WriteStdoutRaw(p []byte) {
 	rc.outMu.Unlock()
 }
 
+// SetWindowTitleEnabled toggles automatic OSC 0 outer window title tagging
+// after attach/switch/restore replays and on explicit UpdateWindowTitle calls.
+func (rc *RPCConn) SetWindowTitleEnabled(enabled bool) {
+	rc.windowTitleEnabled.Store(enabled)
+}
+
+// UpdateWindowTitle updates the tracked session title and immediately emits
+// an OSC 0 title sequence to the outer terminal when window title tagging is enabled.
+func (rc *RPCConn) UpdateWindowTitle(sessionName, innerTitle string) {
+	rc.outMu.Lock()
+	rc.titleSessionName = sessionName
+	rc.titleInner = innerTitle
+	if rc.windowTitleEnabled.Load() && rc.outWriter != nil {
+		if osc := formatWindowTitleOSC(sessionName, innerTitle); len(osc) > 0 {
+			_, _ = rc.outWriter.Write(osc)
+		}
+	}
+	rc.outMu.Unlock()
+}
+
 func (rc *RPCConn) failAll(err error) {
 	rc.closeOnce.Do(func() {
 		rc.rpcMu.Lock()
@@ -156,7 +179,18 @@ func (rc *RPCConn) readLoop() {
 			rc.WriteStdoutRaw(frame.Payload)
 
 		case protocol.MsgReplay:
-			rc.WriteStdoutRaw(frame.Payload)
+			rc.outMu.Lock()
+			if rc.outWriter != nil {
+				if len(frame.Payload) > 0 {
+					_, _ = rc.outWriter.Write(frame.Payload)
+				}
+				if rc.windowTitleEnabled.Load() && rc.titleSessionName != "" {
+					if osc := formatWindowTitleOSC(rc.titleSessionName, rc.titleInner); len(osc) > 0 {
+						_, _ = rc.outWriter.Write(osc)
+					}
+				}
+			}
+			rc.outMu.Unlock()
 
 		case protocol.MsgOpenSwitcher:
 			var ev protocol.OpenSwitcherEvent
@@ -191,6 +225,26 @@ func (rc *RPCConn) readLoop() {
 			}
 
 		default:
+			if rc.windowTitleEnabled.Load() {
+				switch frame.Type {
+				case protocol.MsgAttachResp:
+					var resp protocol.AttachResp
+					if protocol.DecodeJSON(frame.Payload, &resp) == nil && resp.Error == "" && resp.Session.Name != "" {
+						rc.outMu.Lock()
+						rc.titleSessionName = resp.Session.Name
+						rc.titleInner = resp.Session.Title
+						rc.outMu.Unlock()
+					}
+				case protocol.MsgRestoreResp:
+					var resp protocol.RestoreResp
+					if protocol.DecodeJSON(frame.Payload, &resp) == nil && resp.Error == "" && resp.Session != nil && resp.Session.Name != "" {
+						rc.outMu.Lock()
+						rc.titleSessionName = resp.Session.Name
+						rc.titleInner = resp.Session.Title
+						rc.outMu.Unlock()
+					}
+				}
+			}
 			rc.rpcMu.Lock()
 			ch, ok := rc.pending[frame.Type]
 			if ok {
@@ -340,12 +394,22 @@ func (rc *RPCConn) Rename(target, newName string) (protocol.SessionInfo, error) 
 }
 
 func (rc *RPCConn) Preview(target string, rows, cols int) ([]string, bool, error) {
+	resp, err := rc.PreviewScrolled(target, rows, cols, 0)
+	return resp.Lines, resp.InAltScreen, err
+}
+
+func (rc *RPCConn) PreviewScrolled(target string, rows, cols, scrollOffset int) (protocol.PreviewResp, error) {
 	var resp protocol.PreviewResp
-	err := rc.call(protocol.MsgPreviewReq, protocol.PreviewReq{Target: target, Rows: rows, Cols: cols}, protocol.MsgPreviewResp, &resp)
+	err := rc.call(protocol.MsgPreviewReq, protocol.PreviewReq{
+		Target:       target,
+		Rows:         rows,
+		Cols:         cols,
+		ScrollOffset: scrollOffset,
+	}, protocol.MsgPreviewResp, &resp)
 	if err == nil && resp.Error != "" {
 		err = errors.New(resp.Error)
 	}
-	return resp.Lines, resp.InAltScreen, err
+	return resp, err
 }
 
 func (rc *RPCConn) TriggerSwitcher(clientID, sessionID string) error {

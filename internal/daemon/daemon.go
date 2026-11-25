@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/EricWF/mplex/internal/protocol"
 )
@@ -185,7 +186,7 @@ func (d *Daemon) listSessions() []protocol.SessionInfo {
 	return infos
 }
 
-func (d *Daemon) allocateUniqueName(desired string) string {
+func (d *Daemon) allocateUniqueName(desired, cwd, namingMode string) string {
 	desired = strings.TrimSpace(desired)
 	nameExists := func(cand string) bool {
 		for _, s := range d.sessions {
@@ -199,7 +200,24 @@ func (d *Daemon) allocateUniqueName(desired string) string {
 		return false
 	}
 
-	if desired == "" {
+	dedupe := func(base string) string {
+		if !nameExists(base) {
+			return base
+		}
+		for i := 2; ; i++ {
+			cand := fmt.Sprintf("%s-%d", base, i)
+			if !nameExists(cand) {
+				return cand
+			}
+		}
+	}
+
+	if desired != "" {
+		return dedupe(desired)
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(namingMode))
+	if mode == "numeric" {
 		for i := 1; ; i++ {
 			cand := strconv.Itoa(i)
 			if i == 1 && !nameExists("main") {
@@ -210,15 +228,45 @@ func (d *Daemon) allocateUniqueName(desired string) string {
 			}
 		}
 	}
-	if !nameExists(desired) {
-		return desired
-	}
-	for i := 2; ; i++ {
-		cand := fmt.Sprintf("%s-%d", desired, i)
-		if !nameExists(cand) {
-			return cand
+
+	// Default ("", "cwd"): derive session name from directory basename when
+	// cwd is neither empty, "/", nor $HOME.
+	base := "main"
+	if strings.TrimSpace(cwd) != "" {
+		cleanCwd := filepath.Clean(cwd)
+		homeDir, _ := os.UserHomeDir()
+		if homeDir != "" {
+			homeDir = filepath.Clean(homeDir)
+		}
+		if cleanCwd != "/" && cleanCwd != "." && cleanCwd != string(filepath.Separator) &&
+			(homeDir == "" || cleanCwd != homeDir) {
+			if cand := sanitizeSessionName(filepath.Base(cleanCwd)); cand != "" {
+				base = cand
+			}
 		}
 	}
+	return dedupe(base)
+}
+
+func sanitizeSessionName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "." || raw == ".." || raw == "/" {
+		return ""
+	}
+	var b strings.Builder
+	prevDash := false
+	for _, r := range raw {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		prevDash = false
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func (d *Daemon) handleConn(conn net.Conn) {
@@ -291,7 +339,7 @@ func (d *Daemon) dispatchFrame(c *ClientConn, frame protocol.Frame) {
 		}
 		d.mu.Lock()
 		id := fmt.Sprintf("s%d", atomic.AddUint64(&d.nextSessNum, 1))
-		name := d.allocateUniqueName(req.Name)
+		name := d.allocateUniqueName(req.Name, req.Cwd, req.NamingMode)
 		d.mu.Unlock()
 
 		sess, err := newSession(d, id, name, req, d.socketPath)
@@ -301,8 +349,8 @@ func (d *Daemon) dispatchFrame(c *ClientConn, frame protocol.Frame) {
 		}
 
 		d.mu.Lock()
-		// Re-check uniqueness in case of concurrent creation with the same desired name.
-		if unique := d.allocateUniqueName(name); unique != name {
+		// Re-check uniqueness in case of concurrent creation with the same name.
+		if unique := d.allocateUniqueName(name, "", ""); unique != name {
 			sess.Rename(unique)
 		}
 		d.sessions[id] = sess
@@ -443,10 +491,12 @@ func (d *Daemon) dispatchFrame(c *ClientConn, frame protocol.Frame) {
 			c.enqueueJSON(protocol.MsgPreviewResp, protocol.PreviewResp{Error: "session not found"})
 			return
 		}
-		lines, inAlt := sess.Preview(req.Rows, req.Cols)
+		lines, totalLines, actualOffset, inAlt := sess.PreviewScrolled(req.Rows, req.Cols, req.ScrollOffset)
 		c.enqueueJSON(protocol.MsgPreviewResp, protocol.PreviewResp{
-			Lines:       lines,
-			InAltScreen: inAlt,
+			Lines:        lines,
+			InAltScreen:  inAlt,
+			TotalLines:   totalLines,
+			ScrollOffset: actualOffset,
 		})
 
 	case protocol.MsgTriggerSwitcher:

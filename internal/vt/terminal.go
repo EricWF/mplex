@@ -65,6 +65,8 @@ type Terminal struct {
 
 	// Generation counter incremented on every Write (lets client skip replay if unchanged)
 	Generation uint64
+	// BellCount is incremented whenever a BEL (0x07) control character is executed.
+	BellCount uint64
 
 	// Optional callback for replying to queries when detached (nil when client is attached)
 	OnQueryReply QueryResponder
@@ -348,6 +350,7 @@ func (t *Terminal) execute(b byte) {
 	s := t.Active()
 	switch b {
 	case 0x07: // BEL
+		t.BellCount++
 	case 0x08: // BS
 		s.PendingWrap = false
 		if s.CursorCol > 0 {

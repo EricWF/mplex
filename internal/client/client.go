@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,16 +19,18 @@ import (
 
 // Options configures an interactive terminal client session.
 type Options struct {
-	SocketPath     string
-	Trigger        TriggerKey
-	InitialTarget  string   // optional session name/ID to attach immediately
+	SocketPath      string
+	Trigger         TriggerKey
+	InitialTarget   string // optional session name/ID to attach immediately
 	CreateIfMissing bool
-	CreateName     string
-	CreateCwd      string
-	CreateCmd      []string
-	OpenPicker     bool // open switcher immediately on startup
-	Scrollback     int
-	ReplayLines    int
+	CreateName      string
+	CreateCwd       string
+	CreateCmd       []string
+	OpenPicker      bool // open switcher immediately on startup
+	Scrollback      int
+	ReplayLines     int
+	WindowTitle     bool   // tag outer terminal window title with [session] name
+	NamingMode      string // default session naming mode ("cwd" or "numeric")
 }
 
 // RunInteractive connects to the daemon, enters raw terminal mode, and proxies
@@ -42,6 +45,7 @@ func RunInteractive(opts Options) error {
 		return err
 	}
 	defer rc.Close()
+	rc.SetWindowTitleEnabled(opts.WindowTitle)
 
 	sz := readWinSize(os.Stdin)
 	helloResp, err := rc.Hello(protocol.HelloReq{
@@ -65,10 +69,14 @@ func RunInteractive(opts Options) error {
 
 	var exitMessage string
 	defer func() {
+		rc.SetWindowTitleEnabled(false)
 		// Always leave the outer terminal in a clean, usable native state.
 		// ResetOuterModes(true) uses ?1047l which exits alt-screen if active
 		// and is a safe no-op if already on the main screen.
 		rc.WriteStdoutRaw(vt.ResetOuterModes(true))
+		if opts.WindowTitle {
+			rc.WriteStdoutRaw([]byte("\x1b]0;\x07"))
+		}
 		_ = term.Restore(stdinFd, oldState)
 		if exitMessage != "" {
 			fmt.Fprintln(os.Stderr, exitMessage)
@@ -219,6 +227,7 @@ func RunInteractive(opts Options) error {
 			Env:        os.Environ(),
 			Size:       getSize(),
 			Scrollback: opts.Scrollback,
+			NamingMode: opts.NamingMode,
 		})
 		if err != nil {
 			return err
@@ -270,13 +279,21 @@ func RunInteractive(opts Options) error {
 			RefreshCh:        switcherRefreshCh,
 			Out:              os.Stdout,
 			Callbacks: switcher.Callbacks{
-				ListSessions: rc.List,
-				GetPreview:   rc.Preview,
+				ListSessions:       rc.List,
+				GetPreview:         rc.Preview,
+				GetPreviewScrolled: rc.PreviewScrolled,
 				KillSession: func(target string) error {
 					_, err := rc.Kill(target, false)
 					return err
 				},
-				Rename: rc.Rename,
+				Rename: func(target, newName string) (protocol.SessionInfo, error) {
+					sess, err := rc.Rename(target, newName)
+					if err == nil && hasSession && sess.ID == currentSession.ID {
+						currentSession = sess
+						rc.UpdateWindowTitle(sess.Name, sess.Title)
+					}
+					return sess, err
+				},
 				MatchTrigger: func(chunk []byte) ([]byte, bool) {
 					before, matched, after, ok := opts.Trigger.Match(chunk)
 					if ok && len(before) == 0 && len(after) == 0 {
@@ -298,7 +315,7 @@ func RunInteractive(opts Options) error {
 			dropped := rc.ConsumeDroppedFlag()
 			rc.SetSuppressOutput(false)
 			inSwitcher.Store(false)
-			_, err := rc.Restore(protocol.RestoreReq{
+			restResp, err := rc.Restore(protocol.RestoreReq{
 				Size:        getSize(),
 				ReplayLines: opts.ReplayLines,
 				ForceReplay: dropped,
@@ -307,6 +324,9 @@ func RunInteractive(opts Options) error {
 				// Current session may have exited while switcher was open!
 				hasSession = false
 				return false, nil
+			}
+			if restResp.Session != nil {
+				currentSession = *restResp.Session
 			}
 			if res.Action == switcher.ActionSendLiteral {
 				lit := sopt.openedWith
@@ -514,4 +534,28 @@ func drainStrings(ch <-chan string) {
 			return
 		}
 	}
+}
+
+func formatWindowTitle(sessionName, innerTitle string) string {
+	name := strings.TrimSpace(sessionName)
+	title := strings.TrimSpace(innerTitle)
+	if name == "" {
+		return title
+	}
+	prefix := "[" + name + "]"
+	if title == "" {
+		return prefix
+	}
+	if strings.HasPrefix(title, prefix) {
+		return title
+	}
+	return prefix + " " + title
+}
+
+func formatWindowTitleOSC(sessionName, innerTitle string) []byte {
+	formatted := formatWindowTitle(sessionName, innerTitle)
+	if formatted == "" {
+		return nil
+	}
+	return []byte("\x1b]0;" + formatted + "\x07")
 }

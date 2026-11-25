@@ -36,6 +36,8 @@ type Session struct {
 	paused          bool
 	pausedGen       uint64
 	wasInAltAtPause bool
+	lastSeenGen     uint64
+	lastSeenBell    uint64
 	lastActiveAt    time.Time
 	exited          bool
 	exitCode        int
@@ -197,6 +199,8 @@ func (s *Session) readLoop() {
 			client := s.client
 			paused := s.paused
 			if client != nil && !paused {
+				s.lastSeenGen = s.vt.Generation
+				s.lastSeenBell = s.vt.BellCount
 				client.enqueueFrame(protocol.MsgStdout, chunk)
 			}
 			s.mu.Unlock()
@@ -284,6 +288,9 @@ func (s *Session) resizeLocked(sz protocol.WinSize) {
 		Y:    sz.YPixel,
 	})
 	s.vt.Resize(int(sz.Rows), int(sz.Cols))
+	if s.client != nil && !s.paused {
+		s.lastSeenGen = s.vt.Generation
+	}
 }
 
 // Attach atomically attaches client to this session, resizes if needed, builds
@@ -318,6 +325,8 @@ func (s *Session) Attach(c *ClientConn, sz protocol.WinSize, replayLines int) (p
 	s.client = c
 	s.paused = false
 	s.vt.OnQueryReply = nil
+	s.lastSeenGen = s.vt.Generation
+	s.lastSeenBell = s.vt.BellCount
 	s.lastActiveAt = time.Now()
 	info := s.infoLocked()
 
@@ -335,6 +344,10 @@ func (s *Session) Attach(c *ClientConn, sz protocol.WinSize, replayLines int) (p
 func (s *Session) Detach(c *ClientConn) {
 	s.mu.Lock()
 	if s.client == c {
+		if !s.paused {
+			s.lastSeenGen = s.vt.Generation
+			s.lastSeenBell = s.vt.BellCount
+		}
 		s.client = nil
 		s.paused = false
 	}
@@ -349,8 +362,12 @@ func (s *Session) SetPaused(c *ClientConn, paused bool) {
 			s.paused = true
 			s.pausedGen = s.vt.Generation
 			s.wasInAltAtPause = s.vt.InAltScreen
+			s.lastSeenGen = s.vt.Generation
+			s.lastSeenBell = s.vt.BellCount
 		} else if !paused {
 			s.paused = false
+			s.lastSeenGen = s.vt.Generation
+			s.lastSeenBell = s.vt.BellCount
 		}
 	}
 	s.mu.Unlock()
@@ -382,7 +399,10 @@ func (s *Session) Restore(c *ClientConn, req protocol.RestoreReq) error {
 		s.vt.Generation != s.pausedGen
 
 	s.paused = false
+	s.lastSeenGen = s.vt.Generation
+	s.lastSeenBell = s.vt.BellCount
 	s.lastActiveAt = time.Now()
+	info := s.infoLocked()
 
 	var payload []byte
 	if needReplay {
@@ -398,6 +418,7 @@ func (s *Session) Restore(c *ClientConn, req protocol.RestoreReq) error {
 	c.enqueueJSON(protocol.MsgRestoreResp, protocol.RestoreResp{
 		Replayed:    needReplay,
 		InAltScreen: s.vt.InAltScreen,
+		Session:     &info,
 	})
 	c.enqueueFrame(protocol.MsgReplay, payload)
 	return nil
@@ -405,9 +426,17 @@ func (s *Session) Restore(c *ClientConn, req protocol.RestoreReq) error {
 
 // Preview returns ANSI-styled preview lines of the session's active screen.
 func (s *Session) Preview(rows, cols int) ([]string, bool) {
+	lines, _, _, inAlt := s.PreviewScrolled(rows, cols, 0)
+	return lines, inAlt
+}
+
+// PreviewScrolled returns ANSI-styled preview lines scrolled up by scrollOffset
+// lines into scrollback when on the main screen, plus total lines and clamped offset.
+func (s *Session) PreviewScrolled(rows, cols, scrollOffset int) (lines []string, totalLines int, actualOffset int, inAlt bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.vt.RenderPreview(rows, cols), s.vt.InAltScreen
+	lines, totalLines, actualOffset = s.vt.RenderPreviewScrolled(rows, cols, scrollOffset)
+	return lines, totalLines, actualOffset, s.vt.InAltScreen
 }
 
 // Capture extracts the session's screen (and optionally scrollback) as plain or ANSI lines.
@@ -450,6 +479,12 @@ func (s *Session) infoLocked() protocol.SessionInfo {
 		attachedBy = s.client.id
 	}
 
+	var unreadOutput, hasBell bool
+	if s.client == nil || s.paused {
+		unreadOutput = s.vt.Generation > s.lastSeenGen
+		hasBell = s.vt.BellCount > s.lastSeenBell
+	}
+
 	return protocol.SessionInfo{
 		ID:           s.id,
 		Name:         s.name,
@@ -465,6 +500,8 @@ func (s *Session) infoLocked() protocol.SessionInfo {
 		CreatedAt:    s.createdAt,
 		LastActiveAt: s.lastActiveAt,
 		Scrollback:   len(s.vt.Main.Scrollback),
+		UnreadOutput: unreadOutput,
+		HasBell:      hasBell,
 	}
 }
 

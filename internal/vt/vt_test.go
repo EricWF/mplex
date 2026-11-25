@@ -229,13 +229,13 @@ func TestDetachedQueryResponder(t *testing.T) {
 	// Snoop real terminal background color first.
 	term.SnoopClientInput([]byte("\x1b]11;rgb:1a1a/1b1b/2626\x1b\\"))
 
-	term.Write([]byte("\x1b[5;12H"))            // move cursor to row 5 col 12
-	term.Write([]byte("\x1b[?2004h\x1b[>3u"))   // bracketed paste + kitty flags 3
-	term.Write([]byte("\x1b[6n"))               // DSR cursor pos
-	term.Write([]byte("\x1b[?2004$p"))          // DECRQM bracketed paste
-	term.Write([]byte("\x1b[?u"))               // Kitty keyboard query
-	term.Write([]byte("\x1b]11;?\x07"))         // OSC 11 background query
-	term.Write([]byte("\x1b[c"))                // DA1
+	term.Write([]byte("\x1b[5;12H"))          // move cursor to row 5 col 12
+	term.Write([]byte("\x1b[?2004h\x1b[>3u")) // bracketed paste + kitty flags 3
+	term.Write([]byte("\x1b[6n"))             // DSR cursor pos
+	term.Write([]byte("\x1b[?2004$p"))        // DECRQM bracketed paste
+	term.Write([]byte("\x1b[?u"))             // Kitty keyboard query
+	term.Write([]byte("\x1b]11;?\x07"))       // OSC 11 background query
+	term.Write([]byte("\x1b[c"))              // DA1
 
 	want := []string{
 		"\x1b[5;12R",
@@ -263,5 +263,94 @@ func TestOSC7CwdAndAPCGraphicsIgnoredCleanly(t *testing.T) {
 	}
 	if got := lineText(term.Main.Lines[0]); got != "hello" {
 		t.Fatalf("APC leaked onto screen: %q", got)
+	}
+}
+
+func TestBellCount(t *testing.T) {
+	term := New(10, 40, 100)
+	if term.BellCount != 0 {
+		t.Fatalf("initial BellCount = %d, want 0", term.BellCount)
+	}
+
+	// OSC sequences terminated by BEL (0x07) must NOT count as terminal bells.
+	term.Write([]byte("\x1b]0;window title\x07\x1b]7;file://host/tmp\x07normal text"))
+	if term.BellCount != 0 {
+		t.Fatalf("BellCount after OSC BEL terminators = %d, want 0", term.BellCount)
+	}
+
+	// Single BEL in ground state increments BellCount.
+	term.Write([]byte("ping\x07"))
+	if term.BellCount != 1 {
+		t.Fatalf("BellCount after 1 BEL = %d, want 1", term.BellCount)
+	}
+
+	// Multiple BELs increment accurately.
+	term.Write([]byte("\x07\x07done\x07"))
+	if term.BellCount != 4 {
+		t.Fatalf("BellCount after 4 total BELs = %d, want 4", term.BellCount)
+	}
+}
+
+func TestRenderPreviewScrolled(t *testing.T) {
+	term := New(5, 30, 100)
+	// Write 15 lines: line-01 .. line-15 (last line has no trailing newline so cursor is on line-15).
+	for i := 1; i <= 14; i++ {
+		term.Write([]byte(fmt.Sprintf("line-%02d\r\n", i)))
+	}
+	term.Write([]byte("line-15"))
+
+	// 10 lines in scrollback + 5 active rows = 15 total lines.
+	if len(term.Main.Scrollback) != 10 {
+		t.Fatalf("scrollback len = %d, want 10", len(term.Main.Scrollback))
+	}
+
+	// Backward-compatible RenderPreview matches offset=0.
+	base := term.RenderPreview(4, 30)
+	lines, total, actual := term.RenderPreviewScrolled(4, 30, 0)
+	if total != 15 || actual != 0 {
+		t.Fatalf("offset=0: total=%d actual=%d, want 15, 0", total, actual)
+	}
+	wantBottom := []string{"line-12", "line-13", "line-14", "line-15"}
+	if strings.Join(lines, "|") != strings.Join(wantBottom, "|") {
+		t.Fatalf("offset=0 lines = %v, want %v", lines, wantBottom)
+	}
+	if strings.Join(base, "|") != strings.Join(wantBottom, "|") {
+		t.Fatalf("RenderPreview = %v, want %v", base, wantBottom)
+	}
+
+	// Scroll up 6 lines into scrollback.
+	lines, total, actual = term.RenderPreviewScrolled(4, 30, 6)
+	if total != 15 || actual != 6 {
+		t.Fatalf("offset=6: total=%d actual=%d, want 15, 6", total, actual)
+	}
+	wantMid := []string{"line-06", "line-07", "line-08", "line-09"}
+	if strings.Join(lines, "|") != strings.Join(wantMid, "|") {
+		t.Fatalf("offset=6 lines = %v, want %v", lines, wantMid)
+	}
+
+	// Overshooting scrollOffset clamps cleanly to maxOffset (15 - 4 = 11).
+	lines, total, actual = term.RenderPreviewScrolled(4, 30, 999)
+	if total != 15 || actual != 11 {
+		t.Fatalf("offset=999: total=%d actual=%d, want 15, 11", total, actual)
+	}
+	wantTop := []string{"line-01", "line-02", "line-03", "line-04"}
+	if strings.Join(lines, "|") != strings.Join(wantTop, "|") {
+		t.Fatalf("offset=999 lines = %v, want %v", lines, wantTop)
+	}
+
+	// Negative scrollOffset clamps to 0.
+	lines, _, actual = term.RenderPreviewScrolled(4, 30, -10)
+	if actual != 0 || strings.Join(lines, "|") != strings.Join(wantBottom, "|") {
+		t.Fatalf("offset=-10: actual=%d lines=%v", actual, lines)
+	}
+
+	// Alt-screen ignores scrollOffset and always returns actualOffset=0.
+	term.Write([]byte("\x1b[?1049h\x1b[1;1HALT_ROW_1\x1b[2;1HALT_ROW_2"))
+	lines, total, actual = term.RenderPreviewScrolled(4, 30, 5)
+	if total != 5 || actual != 0 {
+		t.Fatalf("alt screen: total=%d actual=%d, want 5, 0", total, actual)
+	}
+	if len(lines) != 4 || lines[0] != "ALT_ROW_1" || lines[1] != "ALT_ROW_2" {
+		t.Fatalf("alt screen lines = %v", lines)
 	}
 }
