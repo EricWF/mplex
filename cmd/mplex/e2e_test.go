@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/creack/pty"
 
+	"github.com/EricWF/mplex/internal/protocol"
 	"github.com/EricWF/mplex/internal/vt"
 )
 
@@ -225,4 +227,413 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		t.Fatalf("expected both 'main' and 'api' sessions alive after detach:\n%s", ls)
 	}
 	fmt.Printf("Full PTY interactive CLI test passed! Active sessions:\n%s", ls)
+}
+
+func TestMultiWindowIndependentSessions(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := filepath.Join(tmp, "mplex.sock")
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	type ptyWindow struct {
+		cmd    *exec.Cmd
+		ptmx   *os.File
+		mu     sync.Mutex
+		outer  *vt.Terminal
+		doneCh chan error
+	}
+
+	launchWindow := func(args ...string) *ptyWindow {
+		t.Helper()
+		fullArgs := append([]string{"--socket", sock}, args...)
+		cmd := exec.Command(bin, fullArgs...)
+		cmd.Env = append(os.Environ(),
+			"SHELL=/bin/sh",
+			"PS1=W$ ",
+			"TERM=xterm-256color",
+			"MPLEX_SESSION=",
+			"MPLEX_SOCKET=",
+			"MPLEX_NO_UPDATE_CHECK=1",
+		)
+		ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 100})
+		if err != nil {
+			t.Fatalf("pty.StartWithSize: %v", err)
+		}
+		w := &ptyWindow{
+			cmd:    cmd,
+			ptmx:   ptmx,
+			outer:  vt.New(24, 100, 1000),
+			doneCh: make(chan error, 1),
+		}
+		go func() {
+			buf := make([]byte, 8192)
+			for {
+				n, err := ptmx.Read(buf)
+				if n > 0 {
+					w.mu.Lock()
+					w.outer.Write(buf[:n])
+					w.mu.Unlock()
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		go func() {
+			w.doneCh <- cmd.Wait()
+		}()
+		t.Cleanup(func() {
+			_ = ptmx.Close()
+		})
+		return w
+	}
+
+	screenOf := func(w *ptyWindow) string {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		s := w.outer.Active()
+		var b strings.Builder
+		for r := 0; r < s.Rows; r++ {
+			for _, c := range s.Lines[r].Cells {
+				if c.Width == 0 {
+					continue
+				}
+				if c.Rune == 0 {
+					b.WriteByte(' ')
+				} else {
+					b.WriteRune(c.Rune)
+				}
+			}
+			b.WriteByte('\n')
+		}
+		return b.String()
+	}
+
+	inAltOf := func(w *ptyWindow) bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.outer.InAltScreen
+	}
+
+	waitCond := func(w *ptyWindow, desc string, fn func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if fn() {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s\n--- SCREEN ---\n%s", desc, screenOf(w))
+	}
+
+	// 1. Window 1 starts mplex with no existing sessions -> creates & attaches to "main".
+	win1 := launchWindow()
+	_, _ = win1.ptmx.Write([]byte("echo WIN1_READY:$MPLEX_SESSION\n"))
+	waitCond(win1, "win1 main session ready", func() bool {
+		return !inAltOf(win1) && strings.Contains(screenOf(win1), "WIN1_READY:main")
+	})
+
+	// 2. Window 2 runs plain `mplex` -> must open session creation/switcher screen with
+	// "+ New session" selected, NOT steal "main" from Window 1!
+	win2 := launchWindow()
+	waitCond(win2, "win2 creation/switcher screen open", func() bool {
+		txt := screenOf(win2)
+		return inAltOf(win2) &&
+			strings.Contains(txt, "New Session") &&
+			strings.Contains(txt, "+ New session") &&
+			strings.Contains(txt, "main")
+	})
+
+	// Verify Window 1 was NOT detached or killed!
+	select {
+	case err := <-win1.doneCh:
+		t.Fatalf("Window 1 exited unexpectedly when Window 2 ran mplex (err=%v)", err)
+	default:
+	}
+
+	// 3. Pressing Enter in Window 2 immediately creates a brand-new session (because
+	// "+ New session" is pre-selected)!
+	_, _ = win2.ptmx.Write([]byte{'\r'})
+	waitCond(win2, "win2 entered new session", func() bool {
+		return !inAltOf(win2)
+	})
+	_, _ = win2.ptmx.Write([]byte("echo WIN2_READY:$MPLEX_SESSION\n"))
+	waitCond(win2, "win2 command output", func() bool {
+		return strings.Contains(screenOf(win2), "WIN2_READY:1")
+	})
+
+	// 4. Verify Window 1 is STILL independently live in "main"!
+	_, _ = win1.ptmx.Write([]byte("echo WIN1_STILL_ALIVE:$MPLEX_SESSION\n"))
+	waitCond(win1, "win1 still live in main", func() bool {
+		return strings.Contains(screenOf(win1), "WIN1_STILL_ALIVE:main")
+	})
+	if strings.Contains(screenOf(win1), "WIN2_READY") || strings.Contains(screenOf(win2), "WIN1_STILL_ALIVE") {
+		t.Fatalf("output leaked across independent windows")
+	}
+
+	// 5. Verify `mplex list` reports BOTH sessions as attached!
+	listOut, err := exec.Command(bin, "--socket", sock, "list").CombinedOutput()
+	if err != nil {
+		t.Fatalf("mplex list failed: %v\n%s", err, listOut)
+	}
+	ls := string(listOut)
+	if strings.Count(ls, "attached") < 2 {
+		t.Fatalf("expected 2 attached sessions in mplex list:\n%s", ls)
+	}
+
+	// 6. Window 3 opens plain `mplex` and presses Esc -> quits cleanly without touching win1/win2!
+	win3 := launchWindow()
+	waitCond(win3, "win3 switcher open", func() bool {
+		return inAltOf(win3) && strings.Contains(screenOf(win3), "New Session")
+	})
+	_, _ = win3.ptmx.Write([]byte{0x1b})
+	select {
+	case err := <-win3.doneCh:
+		if err != nil {
+			t.Fatalf("win3 exited with error on Esc: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("win3 did not exit on Esc")
+	}
+
+	// Cleanly detach win1 and win2 via kill --all in defer.
+}
+
+func TestNewDetachedFlagAfterName(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := filepath.Join(tmp, "mplex.sock")
+	workDir := filepath.Join(tmp, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	// Documented README syntax: flags (-d, -c) AFTER positional session name before `--`.
+	out, err := exec.Command(bin, "--socket", sock, "new", "build", "-d", "-c", workDir, "--", "/bin/sh", "-c", "sleep 30").CombinedOutput()
+	if err != nil {
+		t.Fatalf("mplex new build -d failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `Created session "build"`) {
+		t.Fatalf("unexpected output: %s", out)
+	}
+
+	listOut, err := exec.Command(bin, "--socket", sock, "list").CombinedOutput()
+	if err != nil {
+		t.Fatalf("mplex list failed: %v\n%s", err, listOut)
+	}
+	if !strings.Contains(string(listOut), "build") {
+		t.Fatalf("expected session 'build' in list:\n%s", listOut)
+	}
+}
+
+func TestLLMFriendlyCLIEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := filepath.Join(tmp, "mplex.sock")
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	runCLI := func(args ...string) []byte {
+		t.Helper()
+		full := append([]string{"--socket", sock}, args...)
+		cmd := exec.Command(bin, full...)
+		cmd.Env = append(os.Environ(), "MPLEX_SESSION=", "MPLEX_SESSION_ID=", "MPLEX_SOCKET=", "MPLEX_NO_UPDATE_CHECK=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("mplex %v failed: %v\n%s", args, err, out)
+		}
+		return out
+	}
+
+	// 1. `mplex list --json` with no daemon running returns empty JSON array `[]`.
+	emptyListOut := runCLI("list", "--json")
+	var sessions []protocol.SessionInfo
+	if err := json.Unmarshal(emptyListOut, &sessions); err != nil {
+		t.Fatalf("unmarshal empty list json: %v\n%s", err, emptyListOut)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("expected 0 sessions, got %d", len(sessions))
+	}
+
+	// 2. `mplex new worker -d --json -- /bin/sh` creates a detached session with JSON output.
+	newOut := runCLI("new", "worker", "-d", "--json", "--", "/bin/sh")
+	var created protocol.SessionInfo
+	if err := json.Unmarshal(newOut, &created); err != nil {
+		t.Fatalf("unmarshal new json: %v\n%s", err, newOut)
+	}
+	if created.Name != "worker" || created.ID == "" {
+		t.Fatalf("unexpected created session: %+v", created)
+	}
+
+	// 3. `mplex send worker ... --enter --json` drives the session non-interactively.
+	sendOut := runCLI("send", "worker", "i=1; while [ $i -le 30 ]; do echo LOG_LINE_$i; i=$((i+1)); done; echo WORKER_DONE", "--enter", "--json")
+	var sendResp protocol.SendResp
+	if err := json.Unmarshal(sendOut, &sendResp); err != nil {
+		t.Fatalf("unmarshal send json: %v\n%s", err, sendOut)
+	}
+	if sendResp.Bytes == 0 || sendResp.Session.Name != "worker" {
+		t.Fatalf("unexpected send response: %+v", sendResp)
+	}
+
+	// 4. `mplex capture worker --scrollback --json` reads scrollback + screen output!
+	var capResp protocol.CaptureResp
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		capOut := runCLI("capture", "worker", "--scrollback", "--json")
+		if err := json.Unmarshal(capOut, &capResp); err != nil {
+			t.Fatalf("unmarshal capture json: %v\n%s", err, capOut)
+		}
+		if strings.Contains(capResp.Text, "WORKER_DONE") && strings.Contains(capResp.Text, "LOG_LINE_1") {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !strings.Contains(capResp.Text, "WORKER_DONE") || !strings.Contains(capResp.Text, "LOG_LINE_1") {
+		t.Fatalf("capture did not contain expected scrollback & marker:\n%s", capResp.Text)
+	}
+
+	// Also verify `--lines 5` limits captured lines.
+	tailOut := runCLI("capture", "worker", "--scrollback", "--lines", "5", "--json")
+	var tailResp protocol.CaptureResp
+	if err := json.Unmarshal(tailOut, &tailResp); err != nil {
+		t.Fatalf("unmarshal tail capture: %v", err)
+	}
+	if len(tailResp.Lines) > 5 {
+		t.Fatalf("expected <= 5 lines, got %d", len(tailResp.Lines))
+	}
+
+	// 5. Launch an interactive PTY window attached to "main", then remotely switch it to "worker"
+	// using non-TTY `mplex switch worker --json`!
+	cmd := exec.Command(bin, "--socket", sock, "new", "main")
+	cmd.Env = append(os.Environ(),
+		"SHELL=/bin/sh",
+		"PS1=P$ ",
+		"TERM=xterm-256color",
+		"MPLEX_SESSION=",
+		"MPLEX_SOCKET=",
+		"MPLEX_NO_UPDATE_CHECK=1",
+	)
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 90})
+	if err != nil {
+		t.Fatalf("pty.StartWithSize: %v", err)
+	}
+	defer ptmx.Close()
+
+	var mu sync.Mutex
+	outer := vt.New(24, 90, 1000)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			n, err := ptmx.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				outer.Write(buf[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	outerContains := func(substr string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		s := outer.Active()
+		for r := 0; r < s.Rows; r++ {
+			var b strings.Builder
+			for _, c := range s.Lines[r].Cells {
+				if c.Width == 0 {
+					continue
+				}
+				if c.Rune == 0 {
+					b.WriteByte(' ')
+				} else {
+					b.WriteRune(c.Rune)
+				}
+			}
+			if strings.Contains(b.String(), substr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	_, _ = ptmx.Write([]byte("echo MAIN_WIN_ACTIVE\n"))
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !outerContains("MAIN_WIN_ACTIVE") {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !outerContains("MAIN_WIN_ACTIVE") {
+		t.Fatalf("interactive window did not start in main session")
+	}
+
+	// Non-TTY remote switch from external CLI (LLM tool call)!
+	swOut := runCLI("switch", "worker", "--json")
+	var swResp struct {
+		Switched bool                  `json:"switched"`
+		Client   string                `json:"client"`
+		Session  *protocol.SessionInfo `json:"session"`
+	}
+	if err := json.Unmarshal(swOut, &swResp); err != nil {
+		t.Fatalf("unmarshal switch json: %v\n%s", err, swOut)
+	}
+	if !swResp.Switched || swResp.Session == nil || swResp.Session.Name != "worker" {
+		t.Fatalf("unexpected switch response: %+v", swResp)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !outerContains("WORKER_DONE") {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !outerContains("WORKER_DONE") {
+		t.Fatalf("interactive window did not switch to worker session")
+	}
+
+	// 6. Send special key (--key ctrl-c) without stealing the user's window.
+	keyOut := runCLI("send", "worker", "--key", "ctrl-c", "--json")
+	if err := json.Unmarshal(keyOut, &sendResp); err != nil || sendResp.Bytes != 1 {
+		t.Fatalf("unexpected key send response: %s (err=%v)", keyOut, err)
+	}
+
+	// 7. Rename and Kill with `--json`.
+	renOut := runCLI("rename", "worker", "api", "--json")
+	var renamed protocol.SessionInfo
+	if err := json.Unmarshal(renOut, &renamed); err != nil || renamed.Name != "api" {
+		t.Fatalf("unexpected rename json: %s (err=%v)", renOut, err)
+	}
+
+	killOut := runCLI("kill", "api", "--json")
+	var killResp struct {
+		Killed []string `json:"killed"`
+	}
+	if err := json.Unmarshal(killOut, &killResp); err != nil || len(killResp.Killed) != 1 || killResp.Killed[0] != "api" {
+		t.Fatalf("unexpected kill json: %s (err=%v)", killOut, err)
+	}
 }

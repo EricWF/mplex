@@ -396,6 +396,19 @@ func (s *Session) Preview(rows, cols int) ([]string, bool) {
 	return s.vt.RenderPreview(rows, cols), s.vt.InAltScreen
 }
 
+// Capture extracts the session's screen (and optionally scrollback) as plain or ANSI lines.
+func (s *Session) Capture(req protocol.CaptureReq) (protocol.SessionInfo, []string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lines := s.vt.Capture(vt.CaptureOptions{
+		IncludeScrollback: req.IncludeScrollback,
+		ANSI:              req.ANSI,
+		JoinWrapped:       !req.RawWrap,
+		MaxLines:          req.Lines,
+	})
+	return s.infoLocked(), lines, s.vt.InAltScreen
+}
+
 // Info returns a snapshot of session metadata, enriched with live Linux /proc foreground info.
 func (s *Session) Info() protocol.SessionInfo {
 	s.mu.Lock()

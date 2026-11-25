@@ -225,7 +225,15 @@ func RunInteractive(opts Options) error {
 		return attachSession(sess.ID)
 	}
 
-	runSwitcher := func(notice string, allowCancel bool, openedWith []byte) (exitClient bool, err error) {
+	type switcherOpts struct {
+		notice       string
+		allowCancel  bool
+		preferCreate bool
+		exitOnEsc    bool
+		openedWith   []byte
+	}
+
+	runSwitcher := func(sopt switcherOpts) (exitClient bool, err error) {
 		inSwitcher.Store(true)
 		startStdinReader()
 		rc.SetSuppressOutput(true)
@@ -249,11 +257,13 @@ func RunInteractive(opts Options) error {
 			CurrentSessionID: currentSession.ID,
 			LastSessionID:    lastSessionID,
 			TriggerLabel:     opts.Trigger.Label,
-			Notice:           notice,
+			Notice:           sopt.notice,
 			DefaultCwd:       defaultCwd,
 			Rows:             int(s.Rows),
 			Cols:             int(s.Cols),
-			AllowCancel:      allowCancel && hasSession,
+			AllowCancel:      sopt.allowCancel && hasSession,
+			PreferCreate:     sopt.preferCreate,
+			ExitOnEsc:        sopt.exitOnEsc,
 			InputCh:          switcherInputCh,
 			ResizeCh:         switcherResizeCh,
 			RefreshCh:        switcherRefreshCh,
@@ -298,7 +308,7 @@ func RunInteractive(opts Options) error {
 				return false, nil
 			}
 			if res.Action == switcher.ActionSendLiteral {
-				lit := openedWith
+				lit := sopt.openedWith
 				if len(lit) == 0 {
 					lit = res.Literal
 				}
@@ -311,6 +321,9 @@ func RunInteractive(opts Options) error {
 		case switcher.ActionSelect:
 			inSwitcher.Store(false)
 			if err := attachSession(res.Target); err != nil {
+				if !hasSession {
+					return true, err
+				}
 				return false, nil
 			}
 			return false, nil
@@ -324,8 +337,10 @@ func RunInteractive(opts Options) error {
 
 		case switcher.ActionDetach:
 			inSwitcher.Store(false)
-			_ = rc.Detach("", "")
-			exitMessage = "mplex: detached"
+			if hasSession {
+				_ = rc.Detach("", "")
+				exitMessage = "mplex: detached"
+			}
 			return true, nil
 		}
 
@@ -345,7 +360,7 @@ func RunInteractive(opts Options) error {
 				return err
 			}
 		} else {
-			exitClient, err := runSwitcher("", false, nil)
+			exitClient, err := runSwitcher(switcherOpts{exitOnEsc: true})
 			if err != nil || exitClient {
 				return err
 			}
@@ -377,9 +392,29 @@ func RunInteractive(opts Options) error {
 				return err
 			}
 		} else {
-			// Attach to the most recently active session.
-			if err := attachSession(sessions[0].ID); err != nil {
-				return err
+			anyAttached := false
+			for _, s := range sessions {
+				if s.Attached {
+					anyAttached = true
+					break
+				}
+			}
+			if anyAttached {
+				// Another terminal window already has an active mplex session.
+				// Open the switcher/creation screen with "+ New session" selected
+				// instead of stealing the active session from that window.
+				exitClient, err := runSwitcher(switcherOpts{
+					preferCreate: true,
+					exitOnEsc:    true,
+				})
+				if err != nil || exitClient {
+					return err
+				}
+			} else {
+				// No other window is attached; seamlessly resume the most recent session.
+				if err := attachSession(sessions[0].ID); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -411,15 +446,20 @@ func RunInteractive(opts Options) error {
 			return nil
 
 		case matched := <-triggerOpenCh:
-			exitClient, err := runSwitcher("", true, matched)
+			exitClient, err := runSwitcher(switcherOpts{allowCancel: true, openedWith: matched})
 			if err != nil || exitClient {
 				return err
 			}
 
 		case <-rc.OpenSwitcherCh:
-			exitClient, err := runSwitcher("", true, nil)
+			exitClient, err := runSwitcher(switcherOpts{allowCancel: true})
 			if err != nil || exitClient {
 				return err
+			}
+
+		case ev := <-rc.SwitchSessionCh:
+			if ev.Target != "" && (!hasSession || ev.Target != currentSession.ID) {
+				_ = attachSession(ev.Target)
 			}
 
 		case ev := <-rc.SessionExitedCh:
@@ -434,7 +474,7 @@ func RunInteractive(opts Options) error {
 				return nil
 			}
 			notice := fmt.Sprintf("Session %q exited (code %d)", ev.SessionName, ev.ExitCode)
-			exitClient, err := runSwitcher(notice, false, nil)
+			exitClient, err := runSwitcher(switcherOpts{notice: notice, exitOnEsc: true})
 			if err != nil || exitClient {
 				return err
 			}

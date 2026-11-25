@@ -459,8 +459,72 @@ func (d *Daemon) dispatchFrame(c *ClientConn, frame protocol.Frame) {
 			})
 			return
 		}
+		if req.Target != "" {
+			sess := d.findSession(req.Target)
+			if sess == nil {
+				c.enqueueJSON(protocol.MsgTriggerSwitcherResp, protocol.TriggerSwitcherResp{
+					Error: fmt.Sprintf("session %q not found", req.Target),
+				})
+				return
+			}
+			info := sess.Info()
+			target.enqueueJSON(protocol.MsgSwitchSession, protocol.SwitchSessionEvent{
+				Target: sess.id,
+				Reason: "external",
+			})
+			c.enqueueJSON(protocol.MsgTriggerSwitcherResp, protocol.TriggerSwitcherResp{
+				Client:  target.id,
+				Session: &info,
+			})
+			return
+		}
 		target.enqueueJSON(protocol.MsgOpenSwitcher, protocol.OpenSwitcherEvent{Reason: "external"})
-		c.enqueueJSON(protocol.MsgTriggerSwitcherResp, protocol.TriggerSwitcherResp{})
+		c.enqueueJSON(protocol.MsgTriggerSwitcherResp, protocol.TriggerSwitcherResp{
+			Client: target.id,
+		})
+
+	case protocol.MsgCaptureReq:
+		var req protocol.CaptureReq
+		if err := protocol.DecodeJSON(frame.Payload, &req); err != nil {
+			c.enqueueJSON(protocol.MsgCaptureResp, protocol.CaptureResp{Error: err.Error()})
+			return
+		}
+		sess := d.findSession(req.Target)
+		if sess == nil {
+			c.enqueueJSON(protocol.MsgCaptureResp, protocol.CaptureResp{
+				Error: fmt.Sprintf("session %q not found", req.Target),
+			})
+			return
+		}
+		info, lines, inAlt := sess.Capture(req)
+		c.enqueueJSON(protocol.MsgCaptureResp, protocol.CaptureResp{
+			Session:     info,
+			Lines:       lines,
+			Text:        strings.Join(lines, "\n"),
+			InAltScreen: inAlt,
+		})
+
+	case protocol.MsgSendReq:
+		var req protocol.SendReq
+		if err := protocol.DecodeJSON(frame.Payload, &req); err != nil {
+			c.enqueueJSON(protocol.MsgSendResp, protocol.SendResp{Error: err.Error()})
+			return
+		}
+		sess := d.findSession(req.Target)
+		if sess == nil {
+			c.enqueueJSON(protocol.MsgSendResp, protocol.SendResp{
+				Error: fmt.Sprintf("session %q not found", req.Target),
+			})
+			return
+		}
+		if err := sess.WriteInput(req.Data); err != nil {
+			c.enqueueJSON(protocol.MsgSendResp, protocol.SendResp{Error: err.Error()})
+			return
+		}
+		c.enqueueJSON(protocol.MsgSendResp, protocol.SendResp{
+			Session: sess.Info(),
+			Bytes:   len(req.Data),
+		})
 	}
 }
 

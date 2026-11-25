@@ -51,7 +51,9 @@ type Config struct {
 	DefaultCwd       string
 	Rows             int
 	Cols             int
-	AllowCancel      bool // false when current session exited and user must pick/create/detach
+	AllowCancel      bool // false when not returning to a currently attached session
+	PreferCreate     bool // pre-select "+ New session" when opening unattached (e.g. second window)
+	ExitOnEsc        bool // when AllowCancel is false and query is empty, Esc exits cleanly
 	InputCh          <-chan []byte
 	ResizeCh         <-chan protocol.WinSize
 	RefreshCh        <-chan string
@@ -211,11 +213,42 @@ func (st *state) selectInitial() {
 		for i, e := range st.entries {
 			if !e.isCreate && e.result.Session.ID == st.cfg.CurrentSessionID {
 				st.selected = i
+				st.adjustScroll()
 				return
 			}
 		}
 	}
+	// When opening from another terminal window (or when PreferCreate is requested),
+	// highlight "+ New session" so pressing Enter launches a fresh session rather
+	// than stealing an active session from another window.
+	if st.cfg.PreferCreate {
+		for i, e := range st.entries {
+			if e.isCreate {
+				st.selected = i
+				st.adjustScroll()
+				return
+			}
+		}
+	}
+	// Otherwise prefer the first detached session so we don't accidentally steal
+	// an attached session from another window; fall back to "+ New session" if all
+	// existing sessions are already attached elsewhere.
+	for i, e := range st.entries {
+		if !e.isCreate && !e.result.Session.Attached {
+			st.selected = i
+			st.adjustScroll()
+			return
+		}
+	}
+	for i, e := range st.entries {
+		if e.isCreate {
+			st.selected = i
+			st.adjustScroll()
+			return
+		}
+	}
 	st.selected = 0
+	st.adjustScroll()
 }
 
 func (st *state) rebuildEntries() {
@@ -438,11 +471,14 @@ func (st *state) handleEsc() (Result, bool) {
 		if st.cfg.AllowCancel {
 			return Result{Action: ActionCancel}, true
 		}
-		// If current session exited, Esc clears query instead of closing into nowhere.
 		if len(st.query) > 0 {
 			st.query = st.query[:0]
 			st.cursorPos = 0
 			st.rebuildEntries()
+			return Result{}, false
+		}
+		if st.cfg.ExitOnEsc {
+			return Result{Action: ActionDetach}, true
 		}
 		return Result{}, false
 	}
@@ -500,7 +536,13 @@ func (st *state) handleControlByte(b byte) (Result, bool) {
 				}
 			}
 		}
-		// Fallback: pick first session other than current
+		// Prefer a detached session so Tab doesn't accidentally steal another window's session.
+		for _, s := range st.sessions {
+			if s.ID != st.cfg.CurrentSessionID && !s.Attached {
+				return Result{Action: ActionSelect, Target: s.ID}, true
+			}
+		}
+		// Fallback: pick first session other than current.
 		for _, s := range st.sessions {
 			if s.ID != st.cfg.CurrentSessionID {
 				return Result{Action: ActionSelect, Target: s.ID}, true
@@ -888,12 +930,19 @@ func (st *state) render() {
 		if len(st.sessions) > 1 {
 			hints = append(hints, "Tab:last")
 		}
-		hints = append(hints, "Alt+Enter:new", "Ctrl+R:rename", "Ctrl+X:kill", "Ctrl+Q:detach")
+		hints = append(hints, "Alt+Enter:new", "Ctrl+R:rename", "Ctrl+X:kill")
+		if st.cfg.CurrentSessionID != "" {
+			hints = append(hints, "Ctrl+Q:detach")
+		} else {
+			hints = append(hints, "Ctrl+Q:quit")
+		}
 		if st.cfg.AllowCancel {
 			hints = append(hints, "Esc:back")
 			if st.cfg.TriggerLabel != "" && st.cfg.TriggerLabel != "none" {
 				hints = append(hints, st.cfg.TriggerLabel+":literal")
 			}
+		} else if st.cfg.ExitOnEsc {
+			hints = append(hints, "Esc:quit")
 		}
 		footer := " " + strings.Join(hints, " · ")
 		buf.WriteString("\x1b[2m")
@@ -991,8 +1040,11 @@ func (st *state) renderListRow(buf *bytes.Buffer, e listEntry, selected bool, wi
 	}
 	used += nameW
 
-	// Metadata suffix: fg command + short cwd + age
+	// Metadata suffix: attached status + fg command + short cwd + age
 	var metaParts []string
+	if s.Attached && s.ID != st.cfg.CurrentSessionID {
+		metaParts = append(metaParts, "attached")
+	}
 	if s.FgCommand != "" {
 		metaParts = append(metaParts, s.FgCommand)
 	}
@@ -1051,17 +1103,26 @@ func (st *state) renderPreviewPane(buf *bytes.Buffer, startCol, width int) {
 	if e.isCreate {
 		buf.WriteString(" \x1b[1;32mNew Session\x1b[0m")
 		fmt.Fprintf(buf, "\x1b[4;%dH\x1b[2m%s\x1b[0m", startCol, strings.Repeat("─", width))
+		row := 6
+		if e.createVal != "" {
+			fmt.Fprintf(buf, "\x1b[%d;%dH \x1b[2mName:\x1b[0m      %s", row, startCol, truncateVisual(e.createVal, max(4, width-13)))
+			row++
+		}
 		cwd := shortenPath(st.cfg.DefaultCwd, st.homeDir)
 		if cwd == "" {
 			cwd = "~"
 		}
-		fmt.Fprintf(buf, "\x1b[6;%dH \x1b[2mDirectory:\x1b[0m %s", startCol, truncateVisual(cwd, max(4, width-13)))
+		fmt.Fprintf(buf, "\x1b[%d;%dH \x1b[2mDirectory:\x1b[0m %s", row, startCol, truncateVisual(cwd, max(4, width-13)))
+		row++
 		shell := os.Getenv("SHELL")
 		if shell == "" {
 			shell = "/bin/sh"
 		}
-		fmt.Fprintf(buf, "\x1b[7;%dH \x1b[2mShell:\x1b[0m     %s", startCol, truncateVisual(shell, max(4, width-13)))
-		fmt.Fprintf(buf, "\x1b[9;%dH \x1b[2mPress Enter to launch a native terminal.\x1b[0m", startCol)
+		fmt.Fprintf(buf, "\x1b[%d;%dH \x1b[2mShell:\x1b[0m     %s", row, startCol, truncateVisual(shell, max(4, width-13)))
+		row += 2
+		fmt.Fprintf(buf, "\x1b[%d;%dH \x1b[2mPress Enter to launch a native terminal.\x1b[0m", row, startCol)
+		row++
+		fmt.Fprintf(buf, "\x1b[%d;%dH \x1b[2mType a name above to label it, or pick an existing session.\x1b[0m", row, startCol)
 		return
 	}
 
@@ -1070,7 +1131,9 @@ func (st *state) renderPreviewPane(buf *bytes.Buffer, startCol, width int) {
 	if s.FgCommand != "" {
 		header += " [" + s.FgCommand + "]"
 	}
-	if s.InAltScreen {
+	if s.Attached && s.ID != st.cfg.CurrentSessionID {
+		header += " · active in another window"
+	} else if s.InAltScreen {
 		header += " · fullscreen"
 	} else if s.Scrollback > 0 {
 		header += fmt.Sprintf(" · %d scrollback", s.Scrollback)

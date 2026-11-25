@@ -44,6 +44,11 @@ const (
 	MsgRestoreResp         byte = 32
 	MsgPauseReq            byte = 33
 	MsgPauseResp           byte = 34
+	MsgCaptureReq          byte = 35
+	MsgCaptureResp         byte = 36
+	MsgSendReq             byte = 37
+	MsgSendResp            byte = 38
+	MsgSwitchSession       byte = 39
 )
 
 // MaxFrameSize guards against malformed frames (64 MiB allows huge scrollback replays).
@@ -263,13 +268,21 @@ type PreviewResp struct {
 type TriggerSwitcherReq struct {
 	ClientID  string `json:"client_id,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
+	Target    string `json:"target,omitempty"` // if set, switch client directly to this session
 }
 
 type TriggerSwitcherResp struct {
-	Error string `json:"error,omitempty"`
+	Client  string       `json:"client,omitempty"`
+	Session *SessionInfo `json:"session,omitempty"`
+	Error   string       `json:"error,omitempty"`
 }
 
 type OpenSwitcherEvent struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+type SwitchSessionEvent struct {
+	Target string `json:"target"`
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -301,4 +314,31 @@ type PauseReq struct {
 
 type PauseResp struct {
 	Error string `json:"error,omitempty"`
+}
+
+type CaptureReq struct {
+	Target            string `json:"target"`
+	Lines             int    `json:"lines,omitempty"`
+	IncludeScrollback bool   `json:"include_scrollback,omitempty"`
+	ANSI              bool   `json:"ansi,omitempty"`
+	RawWrap           bool   `json:"raw_wrap,omitempty"`
+}
+
+type CaptureResp struct {
+	Session     SessionInfo `json:"session"`
+	Lines       []string    `json:"lines"`
+	Text        string      `json:"text"`
+	InAltScreen bool        `json:"in_alt_screen"`
+	Error       string      `json:"error,omitempty"`
+}
+
+type SendReq struct {
+	Target string `json:"target"`
+	Data   []byte `json:"data"`
+}
+
+type SendResp struct {
+	Session SessionInfo `json:"session"`
+	Bytes   int         `json:"bytes"`
+	Error   string      `json:"error,omitempty"`
 }

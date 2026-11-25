@@ -36,6 +36,7 @@ type RPCConn struct {
 	droppedWhileSuppressed atomic.Bool
 
 	OpenSwitcherCh  chan protocol.OpenSwitcherEvent
+	SwitchSessionCh chan protocol.SwitchSessionEvent
 	SessionExitedCh chan protocol.SessionExitedEvent
 	DetachedCh      chan protocol.DetachedEvent
 }
@@ -52,6 +53,7 @@ func Dial(socketPath string, out io.Writer) (*RPCConn, error) {
 		closedChan:      make(chan struct{}),
 		outWriter:       out,
 		OpenSwitcherCh:  make(chan protocol.OpenSwitcherEvent, 4),
+		SwitchSessionCh: make(chan protocol.SwitchSessionEvent, 4),
 		SessionExitedCh: make(chan protocol.SessionExitedEvent, 4),
 		DetachedCh:      make(chan protocol.DetachedEvent, 4),
 	}
@@ -161,6 +163,14 @@ func (rc *RPCConn) readLoop() {
 			_ = protocol.DecodeJSON(frame.Payload, &ev)
 			select {
 			case rc.OpenSwitcherCh <- ev:
+			default:
+			}
+
+		case protocol.MsgSwitchSession:
+			var ev protocol.SwitchSessionEvent
+			_ = protocol.DecodeJSON(frame.Payload, &ev)
+			select {
+			case rc.SwitchSessionCh <- ev:
 			default:
 			}
 
@@ -345,4 +355,35 @@ func (rc *RPCConn) TriggerSwitcher(clientID, sessionID string) error {
 		err = errors.New(resp.Error)
 	}
 	return err
+}
+
+func (rc *RPCConn) SwitchSession(clientID, sessionID, target string) (protocol.TriggerSwitcherResp, error) {
+	var resp protocol.TriggerSwitcherResp
+	err := rc.call(protocol.MsgTriggerSwitcher, protocol.TriggerSwitcherReq{
+		ClientID:  clientID,
+		SessionID: sessionID,
+		Target:    target,
+	}, protocol.MsgTriggerSwitcherResp, &resp)
+	if err == nil && resp.Error != "" {
+		err = errors.New(resp.Error)
+	}
+	return resp, err
+}
+
+func (rc *RPCConn) Capture(req protocol.CaptureReq) (protocol.CaptureResp, error) {
+	var resp protocol.CaptureResp
+	err := rc.call(protocol.MsgCaptureReq, req, protocol.MsgCaptureResp, &resp)
+	if err == nil && resp.Error != "" {
+		err = errors.New(resp.Error)
+	}
+	return resp, err
+}
+
+func (rc *RPCConn) SendToSession(target string, data []byte) (protocol.SendResp, error) {
+	var resp protocol.SendResp
+	err := rc.call(protocol.MsgSendReq, protocol.SendReq{Target: target, Data: data}, protocol.MsgSendResp, &resp)
+	if err == nil && resp.Error != "" {
+		err = errors.New(resp.Error)
+	}
+	return resp, err
 }

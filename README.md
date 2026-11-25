@@ -39,7 +39,9 @@ curl -sSL https://github.com/EricWF/mplex/releases/latest/download/mplex-darwin-
 ## Usage
 
 ```bash
-# Attach to the most recent session (or start a new one automatically)
+# Start a session (or resume if detached).
+# When another terminal window is already running an mplex session,
+# opens the session creation/picker screen instead of stealing it!
 ./mplex
 
 # Attach to (or create) a named session
@@ -55,7 +57,13 @@ curl -sSL https://github.com/EricWF/mplex/releases/latest/download/mplex-darwin-
 ./mplex rename work backend
 ./mplex kill build
 ./mplex detach
+
+# Check GitHub Releases and upgrade in place (also prompts automatically when a new release drops)
+./mplex update
+./mplex update --check
 ```
+
+> **Auto-update checks:** On interactive startup, tagged release builds check GitHub Releases at most once every 24 hours (cached locally) and prompt before downloading, SHA-256-verifying, and replacing the binary. Set `MPLEX_NO_UPDATE_CHECK=1` to disable automatic checks.
 
 ## Triggering the Session Switcher
 
@@ -82,5 +90,32 @@ For example, in **Ghostty** (`~/.config/ghostty/config`) or **Kitty** / **WezTer
 | `Ctrl+R` | Rename selected session inline |
 | `Ctrl+X` / `Ctrl+D` | Kill selected session (with confirmation) |
 | `Ctrl+Q` / `Alt+D` | Detach cleanly (sessions keep running in background) |
-| `Esc` / `Ctrl+C` | Cancel and return seamlessly to current session |
+| `Esc` / `Ctrl+C` | Cancel and return seamlessly to current session (or quit when opened unattached) |
 | Trigger key (2nd tap) | Send literal trigger key to current session |
+
+## Automation & LLM-Friendly CLI
+
+Every session-management command works non-interactively and supports `--json` output, so AI assistants and scripts can inspect, drive, and switch your terminal sessions without stealing your window:
+
+```bash
+# Structured session inventory (includes id, pid, fg_command, cwd, title, scrollback, attached)
+mplex list --json
+
+# Create detached sessions with structured metadata output
+mplex new api -d -c ~/projects/api --json -- npm run dev
+
+# Read live screen or scrollback output from any session (soft-wrapped lines joined by default)
+mplex capture api --scrollback --lines 100
+mplex capture api --json
+
+# Send commands or special keys to a session without detaching/stealing the user's window
+mplex send api "npm test" --enter
+mplex send api --key ctrl-c --json
+
+# Remotely switch the active terminal window to a target session
+mplex switch api --json
+
+# Rename or kill sessions with JSON responses
+mplex rename api backend --json
+mplex kill backend --json
+```
