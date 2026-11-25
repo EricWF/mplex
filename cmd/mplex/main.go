@@ -48,13 +48,11 @@ func main() {
 }
 
 func run(args []string) error {
-	socketPath := daemon.DefaultSocketPath()
-	keySpec := os.Getenv("MPLEX_KEY")
-	if keySpec == "" {
-		keySpec = "ctrl-\\"
-	}
-	scrollback := envInt("MPLEX_SCROLLBACK", 10000)
-	replayLines := envInt("MPLEX_REPLAY_LINES", 10000)
+	eff, cfgErr := loadEffectiveConfig()
+	socketPath := eff.Socket
+	keySpec := eff.Key
+	scrollback := eff.Scrollback
+	replayLines := eff.ReplayLines
 
 	// Parse leading global flags before subcommand.
 	fs := flag.NewFlagSet("mplex", flag.ContinueOnError)
@@ -73,6 +71,11 @@ func run(args []string) error {
 		}
 		return err
 	}
+	eff.Socket = socketPath
+	eff.Key = keySpec
+	eff.Scrollback = scrollback
+	eff.ReplayLines = replayLines
+
 	if *showVersion {
 		fmt.Printf("mplex %s\n", currentVersion())
 		return nil
@@ -85,6 +88,14 @@ func run(args []string) error {
 		rest = rest[1:]
 	}
 
+	if cfgErr != nil {
+		switch sub {
+		case "__complete-sessions", "config", "completion", "version", "help", "-h", "--help":
+		default:
+			return cfgErr
+		}
+	}
+
 	switch sub {
 	case "version":
 		fmt.Printf("mplex %s\n", currentVersion())
@@ -93,6 +104,21 @@ func run(args []string) error {
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
+
+	case "config":
+		return runConfigCmd(eff, cfgErr, rest)
+
+	case "completion":
+		return runCompletionCmd(rest)
+
+	case "__complete-sessions":
+		return runCompleteSessionsCmd(socketPath, rest)
+
+	case "save":
+		return runSaveCmd(socketPath, rest)
+
+	case "restore":
+		return runRestoreCmd(socketPath, scrollback, rest)
 
 	case "update", "upgrade":
 		return runUpdateCmd(socketPath, rest)
@@ -186,6 +212,9 @@ func runDaemonCmd(socketPath string, args []string) error {
 
 	d := daemon.New(socketPath)
 	d.AutoExitOnEmpty = true
+	// Catch SIGHUP instead of inheriting SIG_IGN so spawned PTY shells reset
+	// SIGHUP to SIG_DFL across execve and terminate cleanly on `mplex kill`.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP)
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -924,6 +953,9 @@ func maybePromptUpdateAndReexec(socketPath string) {
 		!term.IsTerminal(int(os.Stderr.Fd())) {
 		return
 	}
+	if !autoUpdateEnabled() {
+		return
+	}
 	cfg := updater.Config{
 		CurrentVersion: currentVersion(),
 	}
@@ -1116,6 +1148,10 @@ Usage:
   mplex rename <old> <new> [--json]         Rename a session
   mplex kill <name> | --all [--json]        Kill one or all sessions
   mplex detach [--client id] [--json]       Detach an active client
+  mplex save [name] [flags]                 Save sessions to a workspace snapshot (--file, --with-scrollback, --json)
+  mplex restore [name] [flags]              Restore sessions from a workspace snapshot (--file, --force, --json)
+  mplex config [--path|--init] [--json]     Inspect or initialize config.toml
+  mplex completion <fish|zsh|bash>          Print shell completion script
   mplex update [--check] [-y] [--json]      Check GitHub for a newer release and upgrade in place
 
 Flags & Environment:
@@ -1127,6 +1163,7 @@ Flags & Environment:
   --socket <path>         Daemon Unix socket path (env: MPLEX_SOCKET)
   --scrollback <lines>    Max scrollback lines tracked per session (default: 10000)
   --replay-lines <lines>  Max scrollback lines replayed on switch (default: 10000)
+  MPLEX_CONFIG=<path>     Config file path (default: ~/.config/mplex/config.toml)
   MPLEX_NO_UPDATE_CHECK=1 Disable automatic GitHub release check prompt on startup
 
 Switcher Keys:
