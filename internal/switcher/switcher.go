@@ -35,11 +35,12 @@ type Result struct {
 
 // Callbacks connects the switcher UI to live daemon RPCs.
 type Callbacks struct {
-	ListSessions func() ([]protocol.SessionInfo, error)
-	GetPreview   func(target string, rows, cols int) ([]string, bool, error)
-	KillSession  func(target string) error
-	Rename       func(target, newName string) (protocol.SessionInfo, error)
-	MatchTrigger func(chunk []byte) (matched []byte, ok bool)
+	ListSessions       func() ([]protocol.SessionInfo, error)
+	GetPreview         func(target string, rows, cols int) ([]string, bool, error)
+	GetPreviewScrolled func(target string, rows, cols, scrollOffset int) (protocol.PreviewResp, error)
+	KillSession        func(target string) error
+	Rename             func(target, newName string) (protocol.SessionInfo, error)
+	MatchTrigger       func(chunk []byte) (matched []byte, ok bool)
 }
 
 // Config configures one invocation of the switcher overlay.
@@ -51,9 +52,10 @@ type Config struct {
 	DefaultCwd       string
 	Rows             int
 	Cols             int
-	AllowCancel      bool // false when not returning to a currently attached session
-	PreferCreate     bool // pre-select "+ New session" when opening unattached (e.g. second window)
-	ExitOnEsc        bool // when AllowCancel is false and query is empty, Esc exits cleanly
+	AllowCancel      bool          // false when not returning to a currently attached session
+	PreferCreate     bool          // pre-select "+ New session" when opening unattached (e.g. second window)
+	ExitOnEsc        bool          // when AllowCancel is false and query is empty, Esc exits cleanly
+	RefreshInterval  time.Duration // periodic live refresh interval (0 defaults to 350ms, <0 disables)
 	InputCh          <-chan []byte
 	ResizeCh         <-chan protocol.WinSize
 	RefreshCh        <-chan string
@@ -77,10 +79,14 @@ type listEntry struct {
 }
 
 type previewCacheEntry struct {
-	lines       []string
-	inAltScreen bool
-	rows, cols  int
+	lines        []string
+	inAltScreen  bool
+	totalLines   int
+	scrollOffset int
+	rows, cols   int
 }
+
+const defaultLiveRefreshInterval = 350 * time.Millisecond
 
 // Run displays the fzf-style interactive session switcher on the outer terminal's
 // alternate screen buffer and blocks until the user selects an action.
@@ -124,8 +130,20 @@ func Run(cfg Config) Result {
 	// Pre-select the last-used session if there is another one (makes quick switch fast!),
 	// or current session if only one exists.
 	st.selectInitial()
+	st.syncSelectionScroll()
 	st.ensurePreview()
 	st.render()
+
+	interval := cfg.RefreshInterval
+	if interval == 0 {
+		interval = defaultLiveRefreshInterval
+	}
+	var tickCh <-chan time.Time
+	if interval > 0 {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		tickCh = ticker.C
+	}
 
 	for {
 		select {
@@ -151,8 +169,14 @@ func Run(cfg Config) Result {
 			st.previewCache = make(map[string]previewCacheEntry)
 			st.reloadSessions()
 			st.rebuildEntries()
+			st.syncSelectionScroll()
 			st.ensurePreview()
 			st.render()
+
+		case <-tickCh:
+			if st.mode == modeBrowse && st.liveRefresh() {
+				st.renderIfChanged()
+			}
 
 		case chunk, ok := <-cfg.InputCh:
 			if !ok {
@@ -161,6 +185,7 @@ func Run(cfg Config) Result {
 			if res, done := st.handleInput(chunk); done {
 				return res
 			}
+			st.syncSelectionScroll()
 			st.ensurePreview()
 			st.render()
 		}
@@ -188,7 +213,10 @@ type state struct {
 	killTarget   protocol.SessionInfo
 	notice       string
 
-	previewCache map[string]previewCacheEntry
+	previewScroll     int
+	selectedSessionID string
+	previewCache      map[string]previewCacheEntry
+	lastFrame         []byte
 }
 
 func (st *state) reloadSessions() {
@@ -332,36 +360,210 @@ func (st *state) splitWidths() (leftW, rightW int) {
 	return leftW, rightW
 }
 
-func (st *state) ensurePreview() {
-	if !st.hasPreviewPane() || st.cfg.Callbacks.GetPreview == nil {
-		return
-	}
+func (st *state) currentSelectedID() string {
 	if st.selected < 0 || st.selected >= len(st.entries) {
-		return
+		return ""
 	}
 	e := st.entries[st.selected]
 	if e.isCreate {
-		return
+		return ""
+	}
+	return e.result.Session.ID
+}
+
+func (st *state) syncSelectionScroll() {
+	curID := st.currentSelectedID()
+	if curID != st.selectedSessionID {
+		st.selectedSessionID = curID
+		st.previewScroll = 0
+	}
+}
+
+func (st *state) restoreSelection(prevID string, prevIsCreate bool) {
+	if prevID != "" {
+		for i, e := range st.entries {
+			if !e.isCreate && e.result.Session.ID == prevID {
+				st.selected = i
+				st.adjustScroll()
+				return
+			}
+		}
+	} else if prevIsCreate {
+		for i, e := range st.entries {
+			if e.isCreate {
+				st.selected = i
+				st.adjustScroll()
+				return
+			}
+		}
+	}
+}
+
+func (st *state) previewDimensions() (pRows, pCols int) {
+	if !st.hasPreviewPane() {
+		return 0, 0
 	}
 	_, rightW := st.splitWidths()
-	pRows := st.rows - 5
-	pCols := rightW - 2
+	pRows = st.rows - 6
+	pCols = rightW - 2
+	if pRows < 1 || pCols < 1 {
+		return 0, 0
+	}
+	return pRows, pCols
+}
+
+func (st *state) fetchPreview(id string, pRows, pCols, scrollOffset int) (previewCacheEntry, bool) {
+	if st.cfg.Callbacks.GetPreviewScrolled != nil {
+		resp, err := st.cfg.Callbacks.GetPreviewScrolled(id, pRows, pCols, scrollOffset)
+		if err != nil {
+			return previewCacheEntry{}, false
+		}
+		return previewCacheEntry{
+			lines:        resp.Lines,
+			inAltScreen:  resp.InAltScreen,
+			totalLines:   resp.TotalLines,
+			scrollOffset: resp.ScrollOffset,
+			rows:         pRows,
+			cols:         pCols,
+		}, true
+	}
+	if st.cfg.Callbacks.GetPreview != nil {
+		lines, inAlt, err := st.cfg.Callbacks.GetPreview(id, pRows, pCols)
+		if err != nil {
+			return previewCacheEntry{}, false
+		}
+		return previewCacheEntry{
+			lines:        lines,
+			inAltScreen:  inAlt,
+			totalLines:   len(lines),
+			scrollOffset: 0,
+			rows:         pRows,
+			cols:         pCols,
+		}, true
+	}
+	return previewCacheEntry{}, false
+}
+
+func (st *state) ensurePreview() {
+	st.syncSelectionScroll()
+	if !st.hasPreviewPane() || (st.cfg.Callbacks.GetPreviewScrolled == nil && st.cfg.Callbacks.GetPreview == nil) {
+		return
+	}
+	id := st.currentSelectedID()
+	if id == "" {
+		return
+	}
+	pRows, pCols := st.previewDimensions()
 	if pRows < 1 || pCols < 1 {
 		return
 	}
-	id := e.result.Session.ID
-	if cached, ok := st.previewCache[id]; ok && cached.rows == pRows && cached.cols == pCols {
+	if cached, ok := st.previewCache[id]; ok && cached.rows == pRows && cached.cols == pCols && cached.scrollOffset == st.previewScroll {
 		return
 	}
-	lines, inAlt, err := st.cfg.Callbacks.GetPreview(id, pRows, pCols)
-	if err == nil {
-		st.previewCache[id] = previewCacheEntry{
-			lines:       lines,
-			inAltScreen: inAlt,
-			rows:        pRows,
-			cols:        pCols,
+	if entry, ok := st.fetchPreview(id, pRows, pCols, st.previewScroll); ok {
+		st.previewCache[id] = entry
+		st.previewScroll = entry.scrollOffset
+	}
+}
+
+func (st *state) liveRefresh() bool {
+	changed := false
+
+	prevIsCreate := false
+	prevID := ""
+	if st.selected >= 0 && st.selected < len(st.entries) {
+		prevIsCreate = st.entries[st.selected].isCreate
+		if !prevIsCreate {
+			prevID = st.entries[st.selected].result.Session.ID
 		}
 	}
+
+	if st.cfg.Callbacks.ListSessions != nil {
+		if list, err := st.cfg.Callbacks.ListSessions(); err == nil {
+			if !sessionsEqualForUI(st.sessions, list) {
+				st.sessions = list
+				st.rebuildEntries()
+				st.restoreSelection(prevID, prevIsCreate)
+				changed = true
+			}
+		}
+	}
+
+	st.syncSelectionScroll()
+
+	if st.hasPreviewPane() && (st.cfg.Callbacks.GetPreviewScrolled != nil || st.cfg.Callbacks.GetPreview != nil) {
+		if id := st.currentSelectedID(); id != "" {
+			if pRows, pCols := st.previewDimensions(); pRows > 0 && pCols > 0 {
+				if entry, ok := st.fetchPreview(id, pRows, pCols, st.previewScroll); ok {
+					prev, hasPrev := st.previewCache[id]
+					if !hasPrev || !previewEntriesEqual(prev, entry) {
+						st.previewCache[id] = entry
+						st.previewScroll = entry.scrollOffset
+						changed = true
+					} else {
+						st.previewScroll = entry.scrollOffset
+					}
+				}
+			}
+		}
+	}
+
+	return changed
+}
+
+func (st *state) scrollPreview(delta int) {
+	st.syncSelectionScroll()
+	if !st.hasPreviewPane() {
+		return
+	}
+	if st.currentSelectedID() == "" {
+		return
+	}
+	next := st.previewScroll + delta
+	if next < 0 {
+		next = 0
+	}
+	st.previewScroll = next
+}
+
+func sessionsEqualForUI(a, b []protocol.SessionInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		sa, sb := a[i], b[i]
+		if sa.ID != sb.ID ||
+			sa.Name != sb.Name ||
+			sa.FgCommand != sb.FgCommand ||
+			sa.Cwd != sb.Cwd ||
+			sa.Title != sb.Title ||
+			sa.InAltScreen != sb.InAltScreen ||
+			sa.Attached != sb.Attached ||
+			sa.Scrollback != sb.Scrollback ||
+			sa.UnreadOutput != sb.UnreadOutput ||
+			sa.HasBell != sb.HasBell ||
+			shortAge(sa.LastActiveAt) != shortAge(sb.LastActiveAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func previewEntriesEqual(a, b previewCacheEntry) bool {
+	if a.inAltScreen != b.inAltScreen ||
+		a.totalLines != b.totalLines ||
+		a.scrollOffset != b.scrollOffset ||
+		a.rows != b.rows ||
+		a.cols != b.cols ||
+		len(a.lines) != len(b.lines) {
+		return false
+	}
+	for i := range a.lines {
+		if a.lines[i] != b.lines[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (st *state) handleInput(chunk []byte) (Result, bool) {
@@ -555,6 +757,12 @@ func (st *state) handleControlByte(b byte) (Result, bool) {
 	case 0x0e, 0x0a: // Ctrl+N, Ctrl+J -> down
 		st.moveSelection(1)
 
+	case 0x02: // Ctrl+B -> page preview up by 5 lines
+		st.scrollPreview(5)
+
+	case 0x06: // Ctrl+F -> page preview down by 5 lines
+		st.scrollPreview(-5)
+
 	case 0x0f: // Ctrl+O -> force create new session
 		return Result{Action: ActionCreate, Target: strings.TrimSpace(string(st.query))}, true
 
@@ -700,6 +908,22 @@ func (st *state) handleCSIKey(seq string) {
 		if st.mode == modeBrowse {
 			st.moveSelection(5)
 		}
+	case "1;3A", "1;2A": // Alt+Up, Shift+Up -> scroll preview up
+		if st.mode == modeBrowse {
+			st.scrollPreview(1)
+		}
+	case "1;3B", "1;2B": // Alt+Down, Shift+Down -> scroll preview down
+		if st.mode == modeBrowse {
+			st.scrollPreview(-1)
+		}
+	case "5;3~", "5;2~": // Alt+PageUp, Shift+PageUp -> page preview up
+		if st.mode == modeBrowse {
+			st.scrollPreview(5)
+		}
+	case "6;3~", "6;2~": // Alt+PageDown, Shift+PageDown -> page preview down
+		if st.mode == modeBrowse {
+			st.scrollPreview(-5)
+		}
 	}
 }
 
@@ -729,13 +953,21 @@ func (st *state) handleSGRMouse(chunk []byte) (consumed int, res Result, done bo
 		return end, Result{}, false
 	}
 
+	leftW, rightW := st.splitWidths()
 	switch btn {
 	case 64: // wheel up
-		st.moveSelection(-1)
+		if rightW > 0 && x > leftW {
+			st.scrollPreview(3)
+		} else {
+			st.moveSelection(-1)
+		}
 	case 65: // wheel down
-		st.moveSelection(1)
+		if rightW > 0 && x > leftW {
+			st.scrollPreview(-3)
+		} else {
+			st.moveSelection(1)
+		}
 	case 0: // left click
-		leftW, _ := st.splitWidths()
 		// List starts at 1-indexed terminal row 5 (header=1..2, search=3..4, list=5..)
 		if x <= leftW && y >= 5 && y < 5+st.listViewportHeight() {
 			idx := st.scroll + (y - 5)
@@ -745,6 +977,7 @@ func (st *state) handleSGRMouse(chunk []byte) (consumed int, res Result, done bo
 					return end, r, d
 				}
 				st.selected = idx
+				st.syncSelectionScroll()
 			}
 		}
 	}
@@ -762,6 +995,7 @@ func (st *state) moveSelection(delta int) {
 		st.selected = 0
 	}
 	st.adjustScroll()
+	st.syncSelectionScroll()
 }
 
 func (st *state) moveInputCursor(delta int) {
@@ -816,6 +1050,21 @@ func (st *state) commitRename() {
 }
 
 func (st *state) render() {
+	frame := st.buildFrame()
+	st.lastFrame = frame
+	_, _ = cfgWrite(st.cfg.Out, frame)
+}
+
+func (st *state) renderIfChanged() {
+	frame := st.buildFrame()
+	if bytes.Equal(frame, st.lastFrame) {
+		return
+	}
+	st.lastFrame = frame
+	_, _ = cfgWrite(st.cfg.Out, frame)
+}
+
+func (st *state) buildFrame() []byte {
 	var buf bytes.Buffer
 	buf.Grow(8192)
 
@@ -956,7 +1205,7 @@ func (st *state) render() {
 	}
 	buf.WriteString("\x1b[?2026l") // end synchronized frame
 
-	_, _ = cfgWrite(st.cfg.Out, buf.Bytes())
+	return buf.Bytes()
 }
 
 func (st *state) renderListRow(buf *bytes.Buffer, e listEntry, selected bool, width int) {
@@ -995,6 +1244,10 @@ func (st *state) renderListRow(buf *bytes.Buffer, e listEntry, selected bool, wi
 		buf.WriteString("\x1b[32m●\x1b[0m")
 	} else if s.Attached {
 		buf.WriteString("\x1b[33m●\x1b[0m")
+	} else if s.HasBell {
+		buf.WriteString("\x1b[1;31m◆\x1b[0m")
+	} else if s.UnreadOutput {
+		buf.WriteString("\x1b[36m●\x1b[0m")
 	} else {
 		buf.WriteString("\x1b[2m○\x1b[0m")
 	}
@@ -1039,6 +1292,21 @@ func (st *state) renderListRow(buf *bytes.Buffer, e listEntry, selected bool, wi
 		nameW += rw
 	}
 	used += nameW
+
+	// Activity / bell badge right after session name
+	if s.HasBell && width-used >= 3 {
+		buf.WriteString(" \x1b[1;31m!\x1b[0m")
+		if selected {
+			buf.WriteString("\x1b[48;5;237m")
+		}
+		used += 2
+	} else if s.UnreadOutput && width-used >= 5 {
+		buf.WriteString(" \x1b[36mnew\x1b[0m")
+		if selected {
+			buf.WriteString("\x1b[48;5;237m")
+		}
+		used += 4
+	}
 
 	// Metadata suffix: attached status + fg command + short cwd + age
 	var metaParts []string
@@ -1127,20 +1395,60 @@ func (st *state) renderPreviewPane(buf *bytes.Buffer, startCol, width int) {
 	}
 
 	s := e.result.Session
-	header := fmt.Sprintf(" %s", s.Name)
+	maxW := max(4, width-1)
+	used := 0
+
+	base := fmt.Sprintf(" %s", s.Name)
 	if s.FgCommand != "" {
-		header += " [" + s.FgCommand + "]"
+		base += " [" + s.FgCommand + "]"
 	}
-	if s.Attached && s.ID != st.cfg.CurrentSessionID {
-		header += " · active in another window"
-	} else if s.InAltScreen {
-		header += " · fullscreen"
-	} else if s.Scrollback > 0 {
-		header += fmt.Sprintf(" · %d scrollback", s.Scrollback)
-	}
+	baseTrunc := truncateVisual(base, maxW)
 	buf.WriteString("\x1b[1m")
-	buf.WriteString(truncateVisual(header, max(4, width-1)))
+	buf.WriteString(baseTrunc)
 	buf.WriteString("\x1b[0m")
+	used += runewidth.StringWidth(baseTrunc)
+
+	if s.HasBell {
+		badge := " · ! bell"
+		if bw := runewidth.StringWidth(badge); used+bw <= maxW {
+			buf.WriteString("\x1b[1;31m")
+			buf.WriteString(badge)
+			buf.WriteString("\x1b[0m")
+			used += bw
+		}
+	} else if s.UnreadOutput {
+		badge := " · ● new"
+		if bw := runewidth.StringWidth(badge); used+bw <= maxW {
+			buf.WriteString("\x1b[1;36m")
+			buf.WriteString(badge)
+			buf.WriteString("\x1b[0m")
+			used += bw
+		}
+	}
+
+	if st.previewScroll > 0 {
+		scrollBadge := fmt.Sprintf(" · ↑%d %s", st.previewScroll, plural(st.previewScroll, "line", "lines"))
+		if sw := runewidth.StringWidth(scrollBadge); used+sw <= maxW {
+			buf.WriteString("\x1b[1;33m")
+			buf.WriteString(scrollBadge)
+			buf.WriteString("\x1b[0m")
+			used += sw
+		}
+	}
+
+	suffix := ""
+	if s.Attached && s.ID != st.cfg.CurrentSessionID {
+		suffix = " · active in another window"
+	} else if s.InAltScreen {
+		suffix = " · fullscreen"
+	} else if s.Scrollback > 0 {
+		suffix = fmt.Sprintf(" · %d scrollback", s.Scrollback)
+	}
+	if suffix != "" && maxW-used > 3 {
+		buf.WriteString("\x1b[2m")
+		buf.WriteString(truncateVisual(suffix, maxW-used))
+		buf.WriteString("\x1b[0m")
+	}
 
 	// Row 4: preview divider
 	fmt.Fprintf(buf, "\x1b[4;%dH\x1b[2m%s\x1b[0m", startCol, strings.Repeat("─", width))

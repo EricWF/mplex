@@ -413,3 +413,157 @@ func TestFollowReadOnlyDoesNotDetachActiveClient(t *testing.T) {
 		t.Fatalf("followerLive did not receive MsgSessionExited")
 	}
 }
+
+func TestUnreadOutputBellTrackingAndScrolledPreview(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "mplex-dt-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "m.sock")
+
+	d := daemon.New(sock)
+	go func() {
+		_ = d.Start()
+	}()
+	defer d.Close()
+
+	var rc *client.RPCConn
+	outer := newOuterTermSink(10, 60)
+	waitFor(t, 2*time.Second, "daemon socket", func() bool {
+		c, err := client.Dial(sock, outer)
+		if err != nil {
+			return false
+		}
+		rc = c
+		return true
+	})
+	defer rc.Close()
+
+	// Enable outer window title tagging on rc to also verify OSC 0 emission after replay.
+	rc.SetWindowTitleEnabled(true)
+
+	sz := protocol.WinSize{Rows: 10, Cols: 60}
+	if _, err := rc.Hello(protocol.HelloReq{Size: sz, Term: "xterm-256color", Interactive: true}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+
+	cli, err := client.Dial(sock, nil)
+	if err != nil {
+		t.Fatalf("dial cli: %v", err)
+	}
+	defer cli.Close()
+
+	findInfo := func(id string) protocol.SessionInfo {
+		t.Helper()
+		list, err := cli.List()
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, s := range list {
+			if s.ID == id {
+				return s
+			}
+		}
+		t.Fatalf("session %q not found", id)
+		return protocol.SessionInfo{}
+	}
+
+	// Create a detached session that prints 30 lines, sets an inner title, and waits for stdin.
+	sess, err := cli.Create(protocol.CreateReq{
+		Name: "worker",
+		Cmd:  []string{"/bin/sh", "-c", `printf "\033]2;build-runner\007"; i=1; while [ $i -le 30 ]; do printf "SCROLL_%02d\n" "$i"; i=$((i+1)); done; printf "READY\n"; exec cat`},
+		Size: sz,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Detached session receives output -> UnreadOutput must become true, HasBell false.
+	waitFor(t, 3*time.Second, "detached unread output", func() bool {
+		info := findInfo(sess.ID)
+		return info.UnreadOutput && !info.HasBell && info.Scrollback >= 20
+	})
+
+	// Test PreviewScrolled into scrollback over RPC!
+	bottomPrev, err := cli.PreviewScrolled(sess.ID, 5, 40, 0)
+	if err != nil {
+		t.Fatalf("PreviewScrolled(0): %v", err)
+	}
+	if bottomPrev.ScrollOffset != 0 || bottomPrev.TotalLines < 30 {
+		t.Fatalf("unexpected bottom preview metadata: %+v", bottomPrev)
+	}
+	if !strings.Contains(strings.Join(bottomPrev.Lines, "\n"), "READY") {
+		t.Fatalf("bottom preview missing READY: %v", bottomPrev.Lines)
+	}
+
+	midPrev, err := cli.PreviewScrolled(sess.ID, 5, 40, 20)
+	if err != nil {
+		t.Fatalf("PreviewScrolled(20): %v", err)
+	}
+	if midPrev.ScrollOffset != 20 {
+		t.Fatalf("expected ScrollOffset=20, got %d", midPrev.ScrollOffset)
+	}
+	if strings.Contains(strings.Join(midPrev.Lines, "\n"), "READY") {
+		t.Fatalf("scrolled preview should not still show READY: %v", midPrev.Lines)
+	}
+
+	topPrev, err := cli.PreviewScrolled(sess.ID, 5, 40, 9999)
+	if err != nil {
+		t.Fatalf("PreviewScrolled(9999): %v", err)
+	}
+	if topPrev.ScrollOffset >= topPrev.TotalLines || !strings.Contains(strings.Join(topPrev.Lines, "\n"), "SCROLL_01") {
+		t.Fatalf("top clamped preview unexpected: %+v", topPrev)
+	}
+
+	// Send BEL (0x07) while still detached -> HasBell must become true.
+	if _, err := cli.SendToSession(sess.ID, []byte("ALERT\x07\n")); err != nil {
+		t.Fatalf("send BEL: %v", err)
+	}
+	waitFor(t, 2*time.Second, "detached bell flag", func() bool {
+		info := findInfo(sess.ID)
+		return info.UnreadOutput && info.HasBell
+	})
+
+	// Attach -> both UnreadOutput and HasBell must clear immediately!
+	// And outer window title must be "[worker] build-runner" (not clobbered by replay's OSC 2!).
+	if _, err := rc.Attach(protocol.AttachReq{Target: sess.ID, Size: sz, ReplayLines: 500}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	infoAfterAttach := findInfo(sess.ID)
+	if infoAfterAttach.UnreadOutput || infoAfterAttach.HasBell {
+		t.Fatalf("expected unread/bell cleared on attach, got unread=%v bell=%v", infoAfterAttach.UnreadOutput, infoAfterAttach.HasBell)
+	}
+	waitFor(t, 2*time.Second, "outer window title tagged after replay", func() bool {
+		outer.mu.Lock()
+		defer outer.mu.Unlock()
+		return outer.term.Title == "[worker] build-runner"
+	})
+
+	// Pause client (simulating switcher open), send output + BEL -> both flags trigger while paused!
+	if err := rc.Pause(true); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if _, err := cli.SendToSession(sess.ID, []byte("PAUSED_BELL\x07\n")); err != nil {
+		t.Fatalf("send while paused: %v", err)
+	}
+	waitFor(t, 2*time.Second, "paused unread+bell flags", func() bool {
+		info := findInfo(sess.ID)
+		return info.UnreadOutput && info.HasBell
+	})
+
+	// Restore -> flags clear again!
+	restResp, err := rc.Restore(protocol.RestoreReq{Size: sz, ReplayLines: 500})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if restResp.Session == nil || restResp.Session.Name != "worker" {
+		t.Fatalf("expected RestoreResp.Session populated, got %+v", restResp.Session)
+	}
+	infoAfterRestore := findInfo(sess.ID)
+	if infoAfterRestore.UnreadOutput || infoAfterRestore.HasBell {
+		t.Fatalf("expected unread/bell cleared on restore, got unread=%v bell=%v", infoAfterRestore.UnreadOutput, infoAfterRestore.HasBell)
+	}
+
+	_, _ = cli.Kill("", true)
+}

@@ -176,6 +176,8 @@ type SessionInfo struct {
 	CreatedAt    time.Time `json:"created_at"`
 	LastActiveAt time.Time `json:"last_active_at"`
 	Scrollback   int       `json:"scrollback_lines"`
+	UnreadOutput bool      `json:"unread_output,omitempty"`
+	HasBell      bool      `json:"has_bell,omitempty"`
 }
 
 type HelloReq struct {
@@ -207,6 +209,7 @@ type CreateReq struct {
 	Env        []string `json:"env,omitempty"`
 	Size       WinSize  `json:"size"`
 	Scrollback int      `json:"scrollback,omitempty"`
+	NamingMode string   `json:"naming_mode,omitempty"`
 }
 
 type CreateResp struct {
@@ -256,15 +259,18 @@ type RenameResp struct {
 }
 
 type PreviewReq struct {
-	Target string `json:"target"`
-	Rows   int    `json:"rows"`
-	Cols   int    `json:"cols"`
+	Target       string `json:"target"`
+	Rows         int    `json:"rows"`
+	Cols         int    `json:"cols"`
+	ScrollOffset int    `json:"scroll_offset,omitempty"`
 }
 
 type PreviewResp struct {
-	Lines       []string `json:"lines"`
-	InAltScreen bool     `json:"in_alt_screen"`
-	Error       string   `json:"error,omitempty"`
+	Lines        []string `json:"lines"`
+	InAltScreen  bool     `json:"in_alt_screen"`
+	TotalLines   int      `json:"total_lines,omitempty"`
+	ScrollOffset int      `json:"scroll_offset,omitempty"`
+	Error        string   `json:"error,omitempty"`
 }
 
 type TriggerSwitcherReq struct {
@@ -305,9 +311,10 @@ type RestoreReq struct {
 }
 
 type RestoreResp struct {
-	Replayed    bool   `json:"replayed"`
-	InAltScreen bool   `json:"in_alt_screen"`
-	Error       string `json:"error,omitempty"`
+	Replayed    bool         `json:"replayed"`
+	InAltScreen bool         `json:"in_alt_screen"`
+	Session     *SessionInfo `json:"session,omitempty"`
+	Error       string       `json:"error,omitempty"`
 }
 
 type PauseReq struct {

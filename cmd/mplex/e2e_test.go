@@ -71,14 +71,22 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
 	}()
 
-	// Launch real `mplex` inside a real 24x90 PTY!
+	// Launch real `mplex` inside a real 24x90 PTY in a named project directory
+	// so default cwd naming produces "demo"!
+	projDir := filepath.Join(tmp, "demo")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("mkdir projDir: %v", err)
+	}
 	cmd := exec.Command(bin, "--socket", sock)
+	cmd.Dir = projDir
 	cmd.Env = append(os.Environ(),
 		"SHELL=/bin/sh",
 		"PS1=TESTPROMPT$ ",
 		"TERM=xterm-256color",
 		"MPLEX_SESSION=",
 		"MPLEX_SOCKET=",
+		"MPLEX_NAMING=",
+		"MPLEX_WINDOW_TITLE=",
 		"MPLEX_NO_UPDATE_CHECK=1",
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 90})
@@ -160,14 +168,15 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		t.Fatalf("timed out waiting for %s\n--- SCREEN ---\n%s", desc, screenText())
 	}
 
-	// 1. Verify initial shell starts on main screen buffer and runs commands natively!
-	waitSessionAttached(t, bin, sock, "main")
+	// 1. Verify initial shell starts on main screen buffer with cwd basename "demo" and tags outer window title!
+	waitSessionAttached(t, bin, sock, "demo")
 	_, _ = ptmx.Write([]byte("i=1; while [ $i -le 40 ]; do echo MAIN_SCROLL_$i; i=$((i+1)); done; echo MAIN_DONE:$MPLEX_SESSION\n"))
-	waitCond("main session output + native scrollback", func() bool {
+	waitCond("demo session output + native scrollback + outer window title", func() bool {
 		mu.Lock()
 		inAlt := outer.InAltScreen
+		title := outer.Title
 		mu.Unlock()
-		return !inAlt && strings.Contains(screenText(), "MAIN_DONE:main") && strings.Contains(scrollbackText(), "MAIN_SCROLL_1")
+		return !inAlt && title == "[demo]" && strings.Contains(screenText(), "MAIN_DONE:demo") && strings.Contains(scrollbackText(), "MAIN_SCROLL_1")
 	})
 
 	// 2. Press Ctrl+\ (0x1c) to open the fzf-style switcher!
@@ -177,7 +186,7 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		inAlt := outer.InAltScreen
 		mu.Unlock()
 		txt := screenText()
-		return inAlt && strings.Contains(txt, "mplex") && strings.Contains(txt, "main")
+		return inAlt && strings.Contains(txt, "mplex") && strings.Contains(txt, "demo")
 	})
 
 	// 3. Type "api" and hit Enter to create and switch to a brand-new session "api"!
@@ -187,13 +196,14 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 	})
 	_, _ = ptmx.Write([]byte{'\r'})
 
-	// Wait until we are back on main screen in the fresh "api" session!
+	// Wait until we are back on main screen in the fresh "api" session with outer title "[api]"!
 	waitCond("switched to fresh api session", func() bool {
 		mu.Lock()
 		inAlt := outer.InAltScreen
 		sbLen := len(outer.Main.Scrollback)
+		title := outer.Title
 		mu.Unlock()
-		return !inAlt && sbLen == 0 && !strings.Contains(screenText(), "MAIN_DONE")
+		return !inAlt && sbLen == 0 && title == "[api]" && !strings.Contains(screenText(), "MAIN_DONE")
 	})
 
 	// Run a command inside "api" to verify it's an independent live shell!
@@ -202,22 +212,23 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		return strings.Contains(screenText(), "INSIDE_API_SESSION:api")
 	})
 
-	// 4. Press Ctrl+\ then Tab to quick-toggle back to "main"!
+	// 4. Press Ctrl+\ then Tab to quick-toggle back to "demo"!
 	_, _ = ptmx.Write([]byte{0x1c})
 	waitCond("switcher reopened", func() bool {
 		mu.Lock()
 		inAlt := outer.InAltScreen
 		mu.Unlock()
-		return inAlt && strings.Contains(screenText(), "api") && strings.Contains(screenText(), "main")
+		return inAlt && strings.Contains(screenText(), "api") && strings.Contains(screenText(), "demo")
 	})
 	_, _ = ptmx.Write([]byte{'\t'})
 
-	// Verify we are back in "main" AND outer terminal's NATIVE scrollback has MAIN_SCROLL_1!
-	waitCond("quick-toggled back to main with native scrollback restored", func() bool {
+	// Verify we are back in "demo" AND outer terminal's NATIVE scrollback + window title are restored!
+	waitCond("quick-toggled back to demo with native scrollback restored", func() bool {
 		mu.Lock()
 		inAlt := outer.InAltScreen
+		title := outer.Title
 		mu.Unlock()
-		return !inAlt && strings.Contains(screenText(), "MAIN_DONE") && strings.Contains(scrollbackText(), "MAIN_SCROLL_1")
+		return !inAlt && title == "[demo]" && strings.Contains(screenText(), "MAIN_DONE") && strings.Contains(scrollbackText(), "MAIN_SCROLL_1")
 	})
 
 	// 5. Open switcher and press Ctrl+Q to detach cleanly!
@@ -240,20 +251,23 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		t.Fatalf("mplex did not exit cleanly after Ctrl+Q detach")
 	}
 
-	// Wait for all final output bytes (including ResetOuterModes) to drain from the PTY!
+	// Wait for all final output bytes (including ResetOuterModes + title reset) to drain from the PTY!
 	select {
 	case <-readDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("PTY reader did not drain after mplex exit")
 	}
 
-	// Verify outer terminal was NOT left stuck in alt-screen or mouse mode!
+	// Verify outer terminal was NOT left stuck in alt-screen, mouse mode, or stale window title!
 	mu.Lock()
 	if outer.InAltScreen {
 		t.Fatalf("outer terminal left in alt screen after detach!")
 	}
 	if outer.MouseMode != 0 {
 		t.Fatalf("outer terminal left in mouse mode %d after detach!", outer.MouseMode)
+	}
+	if outer.Title != "" {
+		t.Fatalf("outer terminal window title was not reset on detach: %q", outer.Title)
 	}
 	mu.Unlock()
 
@@ -263,8 +277,8 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		t.Fatalf("mplex list failed: %v\n%s", err, listOut)
 	}
 	ls := string(listOut)
-	if !strings.Contains(ls, "main") || !strings.Contains(ls, "api") {
-		t.Fatalf("expected both 'main' and 'api' sessions alive after detach:\n%s", ls)
+	if !strings.Contains(ls, "demo") || !strings.Contains(ls, "api") {
+		t.Fatalf("expected both 'demo' and 'api' sessions alive after detach:\n%s", ls)
 	}
 	fmt.Printf("Full PTY interactive CLI test passed! Active sessions:\n%s", ls)
 }
@@ -291,16 +305,24 @@ func TestMultiWindowIndependentSessions(t *testing.T) {
 		doneCh chan error
 	}
 
+	workDir := filepath.Join(tmp, "webapp")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+
 	launchWindow := func(args ...string) *ptyWindow {
 		t.Helper()
 		fullArgs := append([]string{"--socket", sock}, args...)
 		cmd := exec.Command(bin, fullArgs...)
+		cmd.Dir = workDir
 		cmd.Env = append(os.Environ(),
 			"SHELL=/bin/sh",
 			"PS1=W$ ",
 			"TERM=xterm-256color",
 			"MPLEX_SESSION=",
 			"MPLEX_SOCKET=",
+			"MPLEX_NAMING=",
+			"MPLEX_WINDOW_TITLE=",
 			"MPLEX_NO_UPDATE_CHECK=1",
 		)
 		ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 100})
@@ -375,23 +397,23 @@ func TestMultiWindowIndependentSessions(t *testing.T) {
 		t.Fatalf("timed out waiting for %s\n--- SCREEN ---\n%s", desc, screenOf(w))
 	}
 
-	// 1. Window 1 starts mplex with no existing sessions -> creates & attaches to "main".
+	// 1. Window 1 starts mplex with no existing sessions -> creates & attaches to "webapp".
 	win1 := launchWindow()
-	waitSessionAttached(t, bin, sock, "main")
+	waitSessionAttached(t, bin, sock, "webapp")
 	_, _ = win1.ptmx.Write([]byte("echo WIN1_READY:$MPLEX_SESSION\n"))
-	waitCond(win1, "win1 main session ready", func() bool {
-		return !inAltOf(win1) && strings.Contains(screenOf(win1), "WIN1_READY:main")
+	waitCond(win1, "win1 webapp session ready", func() bool {
+		return !inAltOf(win1) && strings.Contains(screenOf(win1), "WIN1_READY:webapp")
 	})
 
 	// 2. Window 2 runs plain `mplex` -> must open session creation/switcher screen with
-	// "+ New session" selected, NOT steal "main" from Window 1!
+	// "+ New session" selected, NOT steal "webapp" from Window 1!
 	win2 := launchWindow()
 	waitCond(win2, "win2 creation/switcher screen open", func() bool {
 		txt := screenOf(win2)
 		return inAltOf(win2) &&
 			strings.Contains(txt, "New Session") &&
 			strings.Contains(txt, "+ New session") &&
-			strings.Contains(txt, "main")
+			strings.Contains(txt, "webapp")
 	})
 
 	// Verify Window 1 was NOT detached or killed!
@@ -401,21 +423,20 @@ func TestMultiWindowIndependentSessions(t *testing.T) {
 	default:
 	}
 
-	// 3. Pressing Enter in Window 2 immediately creates a brand-new session (because
-	// "+ New session" is pre-selected)!
+	// 3. Pressing Enter in Window 2 immediately creates a brand-new session ("webapp-2")!
 	_, _ = win2.ptmx.Write([]byte{'\r'})
 	waitCond(win2, "win2 entered new session", func() bool {
 		return !inAltOf(win2)
 	})
 	_, _ = win2.ptmx.Write([]byte("echo WIN2_READY:$MPLEX_SESSION\n"))
 	waitCond(win2, "win2 command output", func() bool {
-		return strings.Contains(screenOf(win2), "WIN2_READY:1")
+		return strings.Contains(screenOf(win2), "WIN2_READY:webapp-2")
 	})
 
-	// 4. Verify Window 1 is STILL independently live in "main"!
+	// 4. Verify Window 1 is STILL independently live in "webapp"!
 	_, _ = win1.ptmx.Write([]byte("echo WIN1_STILL_ALIVE:$MPLEX_SESSION\n"))
-	waitCond(win1, "win1 still live in main", func() bool {
-		return strings.Contains(screenOf(win1), "WIN1_STILL_ALIVE:main")
+	waitCond(win1, "win1 still live in webapp", func() bool {
+		return strings.Contains(screenOf(win1), "WIN1_STILL_ALIVE:webapp")
 	})
 	if strings.Contains(screenOf(win1), "WIN2_READY") || strings.Contains(screenOf(win2), "WIN1_STILL_ALIVE") {
 		t.Fatalf("output leaked across independent windows")
@@ -1400,12 +1421,12 @@ naming = "numeric"
 		"MPLEX_REPLAY_LINES=3333",
 		"MPLEX_AUTO_UPDATE=true",
 		"MPLEX_WINDOW_TITLE=true",
-		"MPLEX_NAMING=git",
+		"MPLEX_NAMING=cwd",
 	}
 	fromEnv := readEffective(envOverrides)
 	if fromEnv.Key != "ctrl-a" || fromEnv.Socket != "/tmp/from-env.sock" ||
 		fromEnv.Scrollback != 7777 || fromEnv.ReplayLines != 3333 ||
-		fromEnv.AutoUpdate != true || fromEnv.WindowTitle != true || fromEnv.Naming != "git" {
+		fromEnv.AutoUpdate != true || fromEnv.WindowTitle != true || fromEnv.Naming != "cwd" {
 		t.Fatalf("env did not override config file: %+v", fromEnv)
 	}
 
@@ -1415,9 +1436,12 @@ naming = "numeric"
 		"--socket", "/tmp/from-cli.sock",
 		"--scrollback", "9999",
 		"--replay-lines", "4444",
+		"--window-title=false",
+		"--naming", "numeric",
 	)
 	if fromCLI.Key != "ctrl-]" || fromCLI.Socket != "/tmp/from-cli.sock" ||
-		fromCLI.Scrollback != 9999 || fromCLI.ReplayLines != 4444 {
+		fromCLI.Scrollback != 9999 || fromCLI.ReplayLines != 4444 ||
+		fromCLI.WindowTitle != false || fromCLI.Naming != "numeric" {
 		t.Fatalf("CLI flags did not override env vars: %+v", fromCLI)
 	}
 
@@ -1529,5 +1553,95 @@ func TestCompletionAndDynamicSessionCompletionEndToEnd(t *testing.T) {
 		if !strings.Contains(line, "\t") {
 			t.Errorf("expected tab-separated description in %q", line)
 		}
+	}
+}
+
+func TestNumericNamingAndWindowTitleDisabled(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+	projDir := filepath.Join(tmp, "myrepo")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	// Verify MPLEX_NAMING=numeric creates "main" and "1" regardless of cwd basename.
+	mk1 := exec.Command(bin, "--socket", sock, "new", "-d", "--json", "--", "/bin/sh", "-c", "sleep 30")
+	mk1.Dir = projDir
+	mk1.Env = append(os.Environ(), "MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"), "MPLEX_NAMING=numeric", "MPLEX_NO_UPDATE_CHECK=1")
+	out1, err := mk1.CombinedOutput()
+	if err != nil {
+		t.Fatalf("new numeric 1 failed: %v\n%s", err, out1)
+	}
+	var s1 protocol.SessionInfo
+	if err := json.Unmarshal(out1, &s1); err != nil || s1.Name != "main" {
+		t.Fatalf("expected numeric session 'main', got %+v (err=%v)", s1, err)
+	}
+
+	mk2 := exec.Command(bin, "--socket", sock, "--naming=numeric", "new", "-d", "--json", "--", "/bin/sh", "-c", "sleep 30")
+	mk2.Dir = projDir
+	mk2.Env = append(os.Environ(), "MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"), "MPLEX_NAMING=", "MPLEX_NO_UPDATE_CHECK=1")
+	out2, err := mk2.CombinedOutput()
+	if err != nil {
+		t.Fatalf("new numeric 2 failed: %v\n%s", err, out2)
+	}
+	var s2 protocol.SessionInfo
+	if err := json.Unmarshal(out2, &s2); err != nil || s2.Name != "1" {
+		t.Fatalf("expected numeric session '1', got %+v (err=%v)", s2, err)
+	}
+
+	// Verify --window-title=false does not overwrite the outer terminal's existing title.
+	cmd := exec.Command(bin, "--socket", sock, "--window-title=false", "attach", "main")
+	cmd.Dir = projDir
+	cmd.Env = append(os.Environ(),
+		"MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"),
+		"SHELL=/bin/sh",
+		"TERM=xterm-256color",
+		"MPLEX_SESSION=",
+		"MPLEX_SOCKET=",
+		"MPLEX_NO_UPDATE_CHECK=1",
+	)
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 90})
+	if err != nil {
+		t.Fatalf("pty.StartWithSize: %v", err)
+	}
+	defer ptmx.Close()
+
+	var mu sync.Mutex
+	outer := vt.New(24, 90, 500)
+	outer.Title = "KEEP_ME"
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := ptmx.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				outer.Write(buf[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	waitSessionAttached(t, bin, sock, "main")
+	// Detach cleanly via external CLI.
+	_ = exec.Command(bin, "--socket", sock, "detach").Run()
+	_ = cmd.Wait()
+
+	mu.Lock()
+	gotTitle := outer.Title
+	mu.Unlock()
+	if gotTitle != "KEEP_ME" {
+		t.Fatalf("expected outer title unchanged ('KEEP_ME') with --window-title=false, got %q", gotTitle)
 	}
 }
