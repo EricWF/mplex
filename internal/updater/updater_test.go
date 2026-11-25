@@ -272,3 +272,17 @@ func TestUpgradeRejectsBadChecksum(t *testing.T) {
 		t.Fatalf("original binary was modified on checksum failure: %q", got)
 	}
 }
+
+func TestMacOSQuarantineHint(t *testing.T) {
+	if h := MacOSQuarantineHint("linux", "/usr/local/bin/mplex"); h != "" {
+		t.Fatalf("expected empty hint on linux, got %q", h)
+	}
+	h := MacOSQuarantineHint("darwin", "/Users/eric/.local/bin/mplex")
+	if !strings.Contains(h, "xattr -d com.apple.quarantine /Users/eric/.local/bin/mplex") {
+		t.Fatalf("unexpected darwin hint: %q", h)
+	}
+	hSpace := MacOSQuarantineHint("darwin", "/Users/eric/My Tools/mplex")
+	if !strings.Contains(hSpace, "xattr -d com.apple.quarantine '/Users/eric/My Tools/mplex'") {
+		t.Fatalf("expected shell-quoted path in hint, got %q", hSpace)
+	}
+}

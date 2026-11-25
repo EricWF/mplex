@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -786,6 +787,9 @@ func runUpdateCmd(socketPath string, args []string) error {
 		})
 	}
 	fmt.Printf("Upgraded mplex to %s (%s)\n", res.LatestVersion, target)
+	if hint := updater.MacOSQuarantineHint(runtime.GOOS, target); hint != "" {
+		fmt.Println(hint)
+	}
 	notifyIfDaemonRunning(socketPath, os.Stdout)
 	return nil
 }
@@ -811,7 +815,12 @@ func maybePromptUpdateAndReexec(socketPath string) {
 	}
 	notifyIfDaemonRunning(socketPath, os.Stderr)
 	env := append(os.Environ(), "MPLEX_SKIP_UPDATE_ONCE=1")
-	_ = syscall.Exec(pr.TargetPath, os.Args, env)
+	if execErr := syscall.Exec(pr.TargetPath, os.Args, env); execErr != nil {
+		fmt.Fprintf(os.Stderr, "mplex: could not relaunch upgraded binary (%v); continuing with current version.\n", execErr)
+		if hint := updater.MacOSQuarantineHint(runtime.GOOS, pr.TargetPath); hint != "" {
+			fmt.Fprintln(os.Stderr, hint)
+		}
+	}
 }
 
 func notifyIfDaemonRunning(socketPath string, out *os.File) {

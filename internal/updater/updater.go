@@ -542,6 +542,9 @@ func PromptIfAvailable(ctx context.Context, cfg Config, in io.Reader, out io.Wri
 		cache.CheckedAt = c.Now()
 		_ = SaveCache(c.CachePath, cache)
 		fmt.Fprintf(out, "Upgraded mplex to %s (%s)\n", res.LatestVersion, target)
+		if hint := MacOSQuarantineHint(c.GOOS, target); hint != "" {
+			fmt.Fprintln(out, hint)
+		}
 		return PromptResult{
 			Prompted:   true,
 			Upgraded:   true,
@@ -634,8 +637,37 @@ func Upgrade(ctx context.Context, cfg Config, rel Release) (string, error) {
 		}
 		return "", err
 	}
+	postInstallBinary(targetPath)
 
 	return targetPath, nil
+}
+
+// MacOSQuarantineHint returns a copy-pasteable command for clearing macOS
+// Gatekeeper quarantine on targetPath when running on darwin, or "" otherwise.
+func MacOSQuarantineHint(goos, targetPath string) string {
+	if goos != "darwin" || targetPath == "" {
+		return ""
+	}
+	return fmt.Sprintf("If macOS Gatekeeper blocks the upgraded binary, allow it with:\n  xattr -d com.apple.quarantine %s", shellQuote(targetPath))
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	needsQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '/' || c == '.' || c == '_' || c == '-' || c == ':' || c == '@' || c == '+') {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func downloadBytes(ctx context.Context, hc *http.Client, url, uaVer string, maxBytes int64) ([]byte, error) {
