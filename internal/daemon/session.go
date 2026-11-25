@@ -65,6 +65,9 @@ func newSession(d *Daemon, id, name string, req protocol.CreateReq, socketPath s
 	} else {
 		shell := req.Shell
 		if shell == "" {
+			shell = lookupEnv(req.Env, "SHELL")
+		}
+		if shell == "" {
 			shell = os.Getenv("SHELL")
 		}
 		if shell == "" {
@@ -120,6 +123,17 @@ func newSession(d *Daemon, id, name string, req protocol.CreateReq, socketPath s
 	go s.queryReplyLoop()
 	go s.readLoop()
 	return s, nil
+}
+
+func lookupEnv(env []string, key string) string {
+	prefix := key + "="
+	val := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			val = strings.TrimPrefix(kv, prefix)
+		}
+	}
+	return val
 }
 
 func buildSessionEnv(clientEnv []string, id, name, socketPath string) []string {

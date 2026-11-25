@@ -285,6 +285,7 @@ func runNewCmd(socketPath, keySpec string, scrollback, replayLines int, args []s
 		sess, err := rc.Create(protocol.CreateReq{
 			Name:       name,
 			Cwd:        startDir,
+			Shell:      os.Getenv("SHELL"),
 			Cmd:        cmdArgs,
 			Env:        os.Environ(),
 			Size:       protocol.WinSize{Rows: 24, Cols: 80},

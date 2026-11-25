@@ -17,13 +17,46 @@ import (
 	"github.com/EricWF/mplex/internal/vt"
 )
 
+// shortTempSock creates a short Unix socket path under /tmp so macOS stays well
+// under its 104-byte sockaddr_un.sun_path limit.
+func shortTempSock(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "mplex-e2e-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "m.sock")
+}
+
+// waitSessionAttached polls `mplex list --json` until the named session exists and is attached.
+func waitSessionAttached(t *testing.T, bin, sock, name string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cmd := exec.Command(bin, "--socket", sock, "list", "--json")
+		cmd.Env = append(os.Environ(), "MPLEX_SESSION=", "MPLEX_SESSION_ID=", "MPLEX_SOCKET=", "MPLEX_NO_UPDATE_CHECK=1")
+		if out, err := cmd.CombinedOutput(); err == nil {
+			var list []protocol.SessionInfo
+			if json.Unmarshal(out, &list) == nil {
+				for _, s := range list {
+					if s.Name == name && s.Attached {
+						return
+					}
+				}
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for session %q to be attached", name)
+}
+
 func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "mplex")
-	sock := filepath.Join(tmp, "mplex.sock")
+	sock := shortTempSock(t)
 
 	build := exec.Command("go", "build", "-o", bin, ".")
-	build.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
@@ -41,6 +74,7 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 		"TERM=xterm-256color",
 		"MPLEX_SESSION=",
 		"MPLEX_SOCKET=",
+		"MPLEX_NO_UPDATE_CHECK=1",
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 90})
 	if err != nil {
@@ -122,12 +156,13 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 	}
 
 	// 1. Verify initial shell starts on main screen buffer and runs commands natively!
-	_, _ = ptmx.Write([]byte("i=1; while [ $i -le 40 ]; do echo MAIN_SCROLL_$i; i=$((i+1)); done; echo MAIN_DONE\n"))
+	waitSessionAttached(t, bin, sock, "main")
+	_, _ = ptmx.Write([]byte("i=1; while [ $i -le 40 ]; do echo MAIN_SCROLL_$i; i=$((i+1)); done; echo MAIN_DONE:$MPLEX_SESSION\n"))
 	waitCond("main session output + native scrollback", func() bool {
 		mu.Lock()
 		inAlt := outer.InAltScreen
 		mu.Unlock()
-		return !inAlt && strings.Contains(screenText(), "MAIN_DONE") && strings.Contains(scrollbackText(), "MAIN_SCROLL_1")
+		return !inAlt && strings.Contains(screenText(), "MAIN_DONE:main") && strings.Contains(scrollbackText(), "MAIN_SCROLL_1")
 	})
 
 	// 2. Press Ctrl+\ (0x1c) to open the fzf-style switcher!
@@ -232,10 +267,9 @@ func TestFullInteractiveCLIInRealPTY(t *testing.T) {
 func TestMultiWindowIndependentSessions(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "mplex")
-	sock := filepath.Join(tmp, "mplex.sock")
+	sock := shortTempSock(t)
 
 	build := exec.Command("go", "build", "-o", bin, ".")
-	build.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
@@ -338,6 +372,7 @@ func TestMultiWindowIndependentSessions(t *testing.T) {
 
 	// 1. Window 1 starts mplex with no existing sessions -> creates & attaches to "main".
 	win1 := launchWindow()
+	waitSessionAttached(t, bin, sock, "main")
 	_, _ = win1.ptmx.Write([]byte("echo WIN1_READY:$MPLEX_SESSION\n"))
 	waitCond(win1, "win1 main session ready", func() bool {
 		return !inAltOf(win1) && strings.Contains(screenOf(win1), "WIN1_READY:main")
@@ -412,14 +447,13 @@ func TestMultiWindowIndependentSessions(t *testing.T) {
 func TestNewDetachedFlagAfterName(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "mplex")
-	sock := filepath.Join(tmp, "mplex.sock")
+	sock := shortTempSock(t)
 	workDir := filepath.Join(tmp, "work")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
 	build := exec.Command("go", "build", "-o", bin, ".")
-	build.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
@@ -448,10 +482,9 @@ func TestNewDetachedFlagAfterName(t *testing.T) {
 func TestLLMFriendlyCLIEndToEnd(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "mplex")
-	sock := filepath.Join(tmp, "mplex.sock")
+	sock := shortTempSock(t)
 
 	build := exec.Command("go", "build", "-o", bin, ".")
-	build.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
@@ -492,7 +525,7 @@ func TestLLMFriendlyCLIEndToEnd(t *testing.T) {
 	}
 
 	// 3. `mplex send worker ... --enter --json` drives the session non-interactively.
-	sendOut := runCLI("send", "worker", "i=1; while [ $i -le 30 ]; do echo LOG_LINE_$i; i=$((i+1)); done; echo WORKER_DONE", "--enter", "--json")
+	sendOut := runCLI("send", "worker", "i=1; while [ $i -le 30 ]; do echo LOG_LINE_$i; i=$((i+1)); done; echo WORKER_READY:$MPLEX_SESSION", "--enter", "--json")
 	var sendResp protocol.SendResp
 	if err := json.Unmarshal(sendOut, &sendResp); err != nil {
 		t.Fatalf("unmarshal send json: %v\n%s", err, sendOut)
@@ -509,12 +542,12 @@ func TestLLMFriendlyCLIEndToEnd(t *testing.T) {
 		if err := json.Unmarshal(capOut, &capResp); err != nil {
 			t.Fatalf("unmarshal capture json: %v\n%s", err, capOut)
 		}
-		if strings.Contains(capResp.Text, "WORKER_DONE") && strings.Contains(capResp.Text, "LOG_LINE_1") {
+		if strings.Contains(capResp.Text, "WORKER_READY:worker") && strings.Contains(capResp.Text, "LOG_LINE_1") {
 			break
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
-	if !strings.Contains(capResp.Text, "WORKER_DONE") || !strings.Contains(capResp.Text, "LOG_LINE_1") {
+	if !strings.Contains(capResp.Text, "WORKER_READY:worker") || !strings.Contains(capResp.Text, "LOG_LINE_1") {
 		t.Fatalf("capture did not contain expected scrollback & marker:\n%s", capResp.Text)
 	}
 
@@ -585,12 +618,13 @@ func TestLLMFriendlyCLIEndToEnd(t *testing.T) {
 		return false
 	}
 
-	_, _ = ptmx.Write([]byte("echo MAIN_WIN_ACTIVE\n"))
+	waitSessionAttached(t, bin, sock, "main")
+	_, _ = ptmx.Write([]byte("echo MAIN_WIN:$MPLEX_SESSION\n"))
 	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && !outerContains("MAIN_WIN_ACTIVE") {
+	for time.Now().Before(deadline) && !outerContains("MAIN_WIN:main") {
 		time.Sleep(25 * time.Millisecond)
 	}
-	if !outerContains("MAIN_WIN_ACTIVE") {
+	if !outerContains("MAIN_WIN:main") {
 		t.Fatalf("interactive window did not start in main session")
 	}
 
@@ -609,10 +643,10 @@ func TestLLMFriendlyCLIEndToEnd(t *testing.T) {
 	}
 
 	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && !outerContains("WORKER_DONE") {
+	for time.Now().Before(deadline) && !outerContains("WORKER_READY:worker") {
 		time.Sleep(25 * time.Millisecond)
 	}
-	if !outerContains("WORKER_DONE") {
+	if !outerContains("WORKER_READY:worker") {
 		t.Fatalf("interactive window did not switch to worker session")
 	}
 

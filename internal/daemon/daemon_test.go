@@ -2,6 +2,7 @@ package daemon_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -83,7 +84,13 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 }
 
 func TestEndToEndDaemonSwitchRestoresScrollbackAndAltScreenModes(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "mplex.sock")
+	// Use a short /tmp dir so macOS Unix socket paths stay well under the 104-byte sun_path limit.
+	sockDir, err := os.MkdirTemp("/tmp", "mplex-dt-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "m.sock")
 	d := daemon.New(sock)
 	go func() {
 		_ = d.Start()

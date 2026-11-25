@@ -214,6 +214,7 @@ func RunInteractive(opts Options) error {
 		sess, err := rc.Create(protocol.CreateReq{
 			Name:       name,
 			Cwd:        cwd,
+			Shell:      os.Getenv("SHELL"),
 			Cmd:        cmd,
 			Env:        os.Environ(),
 			Size:       getSize(),
