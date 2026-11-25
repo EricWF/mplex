@@ -15,6 +15,7 @@ import (
 
 	"github.com/EricWF/mplex/internal/protocol"
 	"github.com/EricWF/mplex/internal/vt"
+	"github.com/EricWF/mplex/internal/workspace"
 )
 
 // shortTempSock creates a short Unix socket path under /tmp so macOS stays well
@@ -746,5 +747,454 @@ func TestMultipleShellsSupported(t *testing.T) {
 	}
 	if tested == 0 {
 		t.Fatalf("no shells found to test")
+	}
+}
+
+func TestWorkspaceSaveRestoreEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	xdgState := filepath.Join(tmp, "state")
+	fakeHome := filepath.Join(tmp, "home")
+	dirA := filepath.Join(tmp, "proj-alpha")
+	dirB := filepath.Join(tmp, "proj-beta")
+	for _, d := range []string{xdgState, fakeHome, dirA, dirB} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	// Resolve symlinks (e.g. /var -> /private/var on macOS) for exact CWD assertions.
+	if r, err := filepath.EvalSymlinks(dirA); err == nil {
+		dirA = r
+	}
+	if r, err := filepath.EvalSymlinks(dirB); err == nil {
+		dirB = r
+	}
+	if r, err := filepath.EvalSymlinks(fakeHome); err == nil {
+		fakeHome = r
+	}
+
+	baseEnv := append(os.Environ(),
+		"HOME="+fakeHome,
+		"XDG_STATE_HOME="+xdgState,
+		"MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"),
+		"SHELL=/bin/sh",
+		"MPLEX_SESSION=",
+		"MPLEX_SESSION_ID=",
+		"MPLEX_SOCKET=",
+		"MPLEX_NO_UPDATE_CHECK=1",
+	)
+
+	runCLI := func(args ...string) []byte {
+		t.Helper()
+		full := append([]string{"--socket", sock}, args...)
+		cmd := exec.Command(bin, full...)
+		cmd.Env = baseEnv
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("mplex %v failed: %v\n%s", args, err, out)
+		}
+		return out
+	}
+
+	// 1. Create two sessions in distinct directories.
+	runCLI("new", "alpha", "-d", "-c", dirA, "--json", "--", "/bin/sh")
+	runCLI("new", "beta", "-d", "-c", dirB, "--json", "--", "/bin/sh")
+
+	// Emit output in alpha so --with-scrollback has content to capture.
+	runCLI("send", "alpha", "echo SAVED_SCROLLBACK_MARKER", "--enter")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		capOut := runCLI("capture", "alpha")
+		if strings.Contains(string(capOut), "SAVED_SCROLLBACK_MARKER") {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	// 2. Save named workspace "work" with scrollback tail.
+	saveOut := runCLI("save", "work", "--with-scrollback", "--json")
+	var saveResp struct {
+		Path string `json:"path"`
+		workspace.Snapshot
+	}
+	if err := json.Unmarshal(saveOut, &saveResp); err != nil {
+		t.Fatalf("unmarshal save json: %v\n%s", err, saveOut)
+	}
+	wantPath := filepath.Join(xdgState, "mplex", "workspaces", "work.json")
+	if saveResp.Path != wantPath {
+		t.Fatalf("save path = %q, want %q", saveResp.Path, wantPath)
+	}
+	if saveResp.Version != workspace.CurrentVersion || saveResp.Name != "work" || len(saveResp.Sessions) != 2 {
+		t.Fatalf("unexpected saved snapshot: %+v", saveResp.Snapshot)
+	}
+	foundMarker := false
+	for _, s := range saveResp.Sessions {
+		if s.Name == "alpha" && strings.Contains(strings.Join(s.ScrollbackTail, "\n"), "SAVED_SCROLLBACK_MARKER") {
+			foundMarker = true
+		}
+	}
+	if !foundMarker {
+		t.Fatalf("expected SAVED_SCROLLBACK_MARKER in alpha scrollback_tail: %+v", saveResp.Sessions)
+	}
+
+	// Also save via explicit --file path.
+	explicitFile := filepath.Join(tmp, "custom-snap.json")
+	runCLI("save", "--file", explicitFile, "--json")
+	if _, err := os.Stat(explicitFile); err != nil {
+		t.Fatalf("expected explicit snapshot file at %s: %v", explicitFile, err)
+	}
+
+	waitNoSessions := func() {
+		t.Helper()
+		dl := time.Now().Add(5 * time.Second)
+		for time.Now().Before(dl) {
+			out := runCLI("list", "--json")
+			var ls []protocol.SessionInfo
+			if json.Unmarshal(out, &ls) == nil && len(ls) == 0 {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for all sessions to exit after kill --all")
+	}
+
+	// 3. Kill all sessions and wait for them to exit.
+	runCLI("kill", "--all", "--json")
+	waitNoSessions()
+
+	// 4. Restore workspace "work" and verify both sessions recreated in exact CWDs!
+	restoreOut := runCLI("restore", "work", "--json")
+	var restoreResp struct {
+		Created []string `json:"created"`
+		Skipped []string `json:"skipped"`
+	}
+	if err := json.Unmarshal(restoreOut, &restoreResp); err != nil {
+		t.Fatalf("unmarshal restore json: %v\n%s", err, restoreOut)
+	}
+	if len(restoreResp.Created) != 2 || len(restoreResp.Skipped) != 0 {
+		t.Fatalf("unexpected restore response: %+v", restoreResp)
+	}
+
+	listOut := runCLI("list", "--json")
+	var listed []protocol.SessionInfo
+	if err := json.Unmarshal(listOut, &listed); err != nil {
+		t.Fatalf("unmarshal list json: %v\n%s", err, listOut)
+	}
+	byName := make(map[string]protocol.SessionInfo, len(listed))
+	for _, s := range listed {
+		byName[s.Name] = s
+	}
+	if len(byName) != 2 {
+		t.Fatalf("expected 2 restored sessions, got %d: %+v", len(byName), listed)
+	}
+	for name, wantDir := range map[string]string{"alpha": dirA, "beta": dirB} {
+		s, ok := byName[name]
+		if !ok {
+			t.Fatalf("missing restored session %q", name)
+		}
+		gotCwd := s.Cwd
+		if r, err := filepath.EvalSymlinks(gotCwd); err == nil {
+			gotCwd = r
+		}
+		if gotCwd != wantDir {
+			t.Errorf("restored session %q Cwd = %q, want %q", name, gotCwd, wantDir)
+		}
+		// Verify live shell PWD inside the restored session matches exact CWD.
+		runCLI("send", name, "echo LIVE_PWD:$(pwd)", "--enter")
+		wantLine := "LIVE_PWD:" + wantDir
+		dl := time.Now().Add(5 * time.Second)
+		matched := false
+		var lastCap string
+		for time.Now().Before(dl) {
+			out := runCLI("capture", name)
+			lastCap = string(out)
+			if strings.Contains(lastCap, wantLine) {
+				matched = true
+				break
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+		if !matched {
+			t.Fatalf("restored session %q live pwd did not match %q:\n%s", name, wantLine, lastCap)
+		}
+	}
+
+	// 5. Restoring again without --force must skip existing sessions.
+	restoreAgainOut := runCLI("restore", "work", "--json")
+	restoreResp = struct {
+		Created []string `json:"created"`
+		Skipped []string `json:"skipped"`
+	}{}
+	if err := json.Unmarshal(restoreAgainOut, &restoreResp); err != nil {
+		t.Fatalf("unmarshal second restore json: %v\n%s", err, restoreAgainOut)
+	}
+	if len(restoreResp.Created) != 0 || len(restoreResp.Skipped) != 2 {
+		t.Fatalf("expected 0 created & 2 skipped, got %+v", restoreResp)
+	}
+
+	// 6. Restoring with --force must create deduplicated sessions (alpha-2, beta-2).
+	restoreForceOut := runCLI("restore", "work", "--force", "--json")
+	restoreResp = struct {
+		Created []string `json:"created"`
+		Skipped []string `json:"skipped"`
+	}{}
+	if err := json.Unmarshal(restoreForceOut, &restoreResp); err != nil {
+		t.Fatalf("unmarshal force restore json: %v\n%s", err, restoreForceOut)
+	}
+	if len(restoreResp.Created) != 2 || len(restoreResp.Skipped) != 0 {
+		t.Fatalf("expected 2 deduplicated created & 0 skipped, got %+v", restoreResp)
+	}
+
+	// 7. Missing CWD falls back to $HOME on restore.
+	runCLI("kill", "--all", "--json")
+	waitNoSessions()
+	if err := os.RemoveAll(dirB); err != nil {
+		t.Fatalf("remove dirB: %v", err)
+	}
+	runCLI("restore", "--file", explicitFile, "--json")
+	listOut = runCLI("list", "--json")
+	listed = nil
+	if err := json.Unmarshal(listOut, &listed); err != nil {
+		t.Fatalf("unmarshal list json after missing cwd restore: %v", err)
+	}
+	for _, s := range listed {
+		if s.Name == "beta" {
+			gotCwd := s.Cwd
+			if r, err := filepath.EvalSymlinks(gotCwd); err == nil {
+				gotCwd = r
+			}
+			if gotCwd != fakeHome {
+				t.Errorf("restored session beta with deleted dir got Cwd=%q, want HOME=%q", gotCwd, fakeHome)
+			}
+		}
+	}
+}
+
+func TestConfigPrecedenceAndCommandsEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	cfgPath := filepath.Join(tmp, "cfg", "config.toml")
+	cleanEnv := func(extra ...string) []string {
+		env := []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOME=" + tmp,
+			"MPLEX_CONFIG=" + cfgPath,
+		}
+		return append(env, extra...)
+	}
+
+	// 1. `mplex config --path`
+	cmd := exec.Command(bin, "config", "--path")
+	cmd.Env = cleanEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("config --path failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != cfgPath {
+		t.Fatalf("config --path = %q, want %q", strings.TrimSpace(string(out)), cfgPath)
+	}
+
+	// 2. `mplex config --init` writes starter config, refuses overwrite without --force.
+	cmd = exec.Command(bin, "config", "--init", "--json")
+	cmd.Env = cleanEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("config --init failed: %v\n%s", err, out)
+	}
+	cmd = exec.Command(bin, "config", "--init")
+	cmd.Env = cleanEnv()
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected second config --init without --force to fail, got: %s", out)
+	}
+
+	// 3. Write custom config file and verify config file overrides built-in defaults.
+	customTOML := `
+key = "alt-s"
+socket = "/tmp/from-cfg.sock"
+scrollback = 5000
+replay_lines = 2500
+auto_update = false
+window_title = false
+naming = "numeric"
+`
+	if err := os.WriteFile(cfgPath, []byte(customTOML), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	readEffective := func(extraEnv []string, cliArgs ...string) effectiveConfig {
+		t.Helper()
+		args := append(cliArgs, "config", "--json")
+		c := exec.Command(bin, args...)
+		c.Env = cleanEnv(extraEnv...)
+		raw, err := c.CombinedOutput()
+		if err != nil {
+			t.Fatalf("mplex %v failed: %v\n%s", args, err, raw)
+		}
+		var eff effectiveConfig
+		if err := json.Unmarshal(raw, &eff); err != nil {
+			t.Fatalf("unmarshal config json: %v\n%s", err, raw)
+		}
+		return eff
+	}
+
+	fromFile := readEffective(nil)
+	if !fromFile.ConfigExists || fromFile.Key != "alt-s" || fromFile.Socket != "/tmp/from-cfg.sock" ||
+		fromFile.Scrollback != 5000 || fromFile.ReplayLines != 2500 ||
+		fromFile.AutoUpdate != false || fromFile.WindowTitle != false || fromFile.Naming != "numeric" {
+		t.Fatalf("unexpected config from file: %+v", fromFile)
+	}
+
+	// 4. Env vars override config file.
+	envOverrides := []string{
+		"MPLEX_KEY=ctrl-a",
+		"MPLEX_SOCKET=/tmp/from-env.sock",
+		"MPLEX_SCROLLBACK=7777",
+		"MPLEX_REPLAY_LINES=3333",
+		"MPLEX_AUTO_UPDATE=true",
+		"MPLEX_WINDOW_TITLE=true",
+		"MPLEX_NAMING=git",
+	}
+	fromEnv := readEffective(envOverrides)
+	if fromEnv.Key != "ctrl-a" || fromEnv.Socket != "/tmp/from-env.sock" ||
+		fromEnv.Scrollback != 7777 || fromEnv.ReplayLines != 3333 ||
+		fromEnv.AutoUpdate != true || fromEnv.WindowTitle != true || fromEnv.Naming != "git" {
+		t.Fatalf("env did not override config file: %+v", fromEnv)
+	}
+
+	// 5. CLI flags override env vars!
+	fromCLI := readEffective(envOverrides,
+		"--key", "ctrl-]",
+		"--socket", "/tmp/from-cli.sock",
+		"--scrollback", "9999",
+		"--replay-lines", "4444",
+	)
+	if fromCLI.Key != "ctrl-]" || fromCLI.Socket != "/tmp/from-cli.sock" ||
+		fromCLI.Scrollback != 9999 || fromCLI.ReplayLines != 4444 {
+		t.Fatalf("CLI flags did not override env vars: %+v", fromCLI)
+	}
+
+	// 6. `--init --force` recovers even from a malformed config file.
+	if err := os.WriteFile(cfgPath, []byte("scrollback = invalid\n"), 0o644); err != nil {
+		t.Fatalf("write bad config: %v", err)
+	}
+	cmd = exec.Command(bin, "config", "--json")
+	cmd.Env = cleanEnv()
+	if _, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected error on malformed config file")
+	}
+	cmd = exec.Command(bin, "config", "--init", "--force")
+	cmd.Env = cleanEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("config --init --force failed: %v\n%s", err, out)
+	}
+	recovered := readEffective(nil)
+	if recovered.Key != `ctrl-\` || recovered.Scrollback != 10000 {
+		t.Fatalf("unexpected recovered config: %+v", recovered)
+	}
+}
+
+func TestCompletionAndDynamicSessionCompletionEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	env := append(os.Environ(),
+		"MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"),
+		"SHELL=/bin/sh",
+		"MPLEX_SESSION=",
+		"MPLEX_SESSION_ID=",
+		"MPLEX_SOCKET=",
+		"MPLEX_NO_UPDATE_CHECK=1",
+	)
+
+	// 1. `mplex completion <fish|zsh|bash>` succeeds; unknown shell fails.
+	for _, sh := range []string{"fish", "zsh", "bash"} {
+		cmd := exec.Command(bin, "completion", sh)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("mplex completion %s failed: %v\n%s", sh, err, out)
+		}
+		if !strings.Contains(string(out), "__complete-sessions") {
+			t.Fatalf("mplex completion %s missing __complete-sessions", sh)
+		}
+	}
+	badCmd := exec.Command(bin, "completion", "tcsh")
+	badCmd.Env = env
+	if _, err := badCmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected mplex completion tcsh to fail")
+	}
+
+	// 2. `__complete-sessions` when daemon is NOT running exits 0 silently with empty output.
+	start := time.Now()
+	emptyCmd := exec.Command(bin, "--socket", sock, "__complete-sessions")
+	emptyCmd.Env = env
+	out, err := emptyCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("__complete-sessions without daemon exited non-zero: %v\n%s", err, out)
+	}
+	if len(out) != 0 {
+		t.Fatalf("expected empty output without daemon, got %q", string(out))
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("__complete-sessions without daemon took too long: %v", elapsed)
+	}
+
+	// 3. Start two sessions and verify plain and `--describe` output.
+	for _, name := range []string{"alpha", "beta"} {
+		mk := exec.Command(bin, "--socket", sock, "new", name, "-d", "--json", "--", "/bin/sh")
+		mk.Env = env
+		if out, err := mk.CombinedOutput(); err != nil {
+			t.Fatalf("new %s failed: %v\n%s", name, err, out)
+		}
+	}
+
+	plainCmd := exec.Command(bin, "--socket", sock, "__complete-sessions")
+	plainCmd.Env = env
+	plainOut, err := plainCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("__complete-sessions failed: %v\n%s", err, plainOut)
+	}
+	lines := strings.Split(strings.TrimSpace(string(plainOut)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 session completion lines, got %q", string(plainOut))
+	}
+	if !strings.Contains(string(plainOut), "alpha") || !strings.Contains(string(plainOut), "beta") {
+		t.Fatalf("unexpected completion output: %q", string(plainOut))
+	}
+
+	descCmd := exec.Command(bin, "--socket", sock, "__complete-sessions", "--describe")
+	descCmd.Env = env
+	descOut, err := descCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("__complete-sessions --describe failed: %v\n%s", err, descOut)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(descOut)), "\n") {
+		if !strings.Contains(line, "\t") {
+			t.Errorf("expected tab-separated description in %q", line)
+		}
 	}
 }
