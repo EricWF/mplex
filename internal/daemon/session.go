@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,7 +46,9 @@ type Session struct {
 
 	queryReplyCh chan []byte
 	done         chan struct{}
+	readDone     chan struct{}
 	waitDone     chan struct{}
+	lastReadUnix atomic.Int64
 	closeOnce    sync.Once
 	killOnce     sync.Once
 }
@@ -124,11 +127,13 @@ func newSession(d *Daemon, id, name string, req protocol.CreateReq, socketPath s
 		lastActiveAt: now,
 		queryReplyCh: make(chan []byte, 64),
 		done:         make(chan struct{}),
+		readDone:     make(chan struct{}),
 		waitDone:     make(chan struct{}),
 	}
 
 	go s.queryReplyLoop()
 	go s.readLoop()
+	go s.waitLoop()
 	return s, nil
 }
 
@@ -180,14 +185,20 @@ func (s *Session) queryReplyLoop() {
 }
 
 func (s *Session) readLoop() {
+	defer close(s.readDone)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
+			s.lastReadUnix.Store(time.Now().UnixNano())
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 
 			s.mu.Lock()
+			if s.exited {
+				s.mu.Unlock()
+				return
+			}
 			if s.client == nil || s.paused {
 				s.vt.OnQueryReply = func(reply []byte) {
 					cp := append([]byte(nil), reply...)
@@ -216,12 +227,14 @@ func (s *Session) readLoop() {
 		if err != nil {
 			// On Linux PTY masters, EIO indicates the slave side closed (normal process exit).
 			if errors.Is(err, io.EOF) || errors.Is(err, syscall.EIO) || errors.Is(err, os.ErrClosed) {
-				break
+				return
 			}
-			break
+			return
 		}
 	}
+}
 
+func (s *Session) waitLoop() {
 	exitCode := 0
 	if err := s.cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
@@ -233,6 +246,42 @@ func (s *Session) readLoop() {
 	}
 	close(s.waitDone)
 
+	// Allow readLoop to finish draining any buffered PTY output written right
+	// before the session leader exited. When no background child holds the slave
+	// PTY fd open, ptmx.Read hits EIO/EOF almost immediately. If a descendant
+	// keeps the slave fd open, stop waiting once output goes idle (or after a
+	// short hard cap) so exiting the shell never hangs the client window.
+	const (
+		drainIdleTimeout = 50 * time.Millisecond
+		drainMaxTimeout  = 500 * time.Millisecond
+	)
+	drainDeadline := time.Now().Add(drainMaxTimeout)
+	for {
+		select {
+		case <-s.readDone:
+			goto drained
+		case <-time.After(drainIdleTimeout):
+			last := time.Unix(0, s.lastReadUnix.Load())
+			if time.Now().After(drainDeadline) || time.Since(last) >= drainIdleTimeout {
+				// A lingering child still holds the slave PTY open: send SIGHUP to
+				// the session process group and close the PTY master to tear down.
+				if s.cmd != nil && s.cmd.Process != nil {
+					_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGHUP)
+				}
+				s.closeOnce.Do(func() {
+					close(s.done)
+					_ = s.ptmx.Close()
+				})
+				select {
+				case <-s.readDone:
+				case <-time.After(50 * time.Millisecond):
+				}
+				goto drained
+			}
+		}
+	}
+
+drained:
 	s.closeOnce.Do(func() {
 		close(s.done)
 		_ = s.ptmx.Close()
@@ -251,6 +300,10 @@ func (s *Session) readLoop() {
 	clear(s.followers)
 	s.mu.Unlock()
 
+	// Remove the exited session from the daemon BEFORE notifying clients so a
+	// client calling rc.List() on MsgSessionExited never sees the dead session.
+	s.daemon.removeSession(s.id)
+
 	exitEv := protocol.SessionExitedEvent{
 		SessionID:   s.id,
 		SessionName: name,
@@ -264,8 +317,6 @@ func (s *Session) readLoop() {
 		f.clearFollowed(s)
 		f.enqueueJSON(protocol.MsgSessionExited, exitEv)
 	}
-
-	s.daemon.removeSession(s.id)
 }
 
 // WriteInput writes raw bytes from the attached client directly to the PTY.

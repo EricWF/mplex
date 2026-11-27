@@ -2088,3 +2088,88 @@ func TestStatusCommandInsideAndOutsideSession(t *testing.T) {
 		t.Fatalf("unexpected inside status json: %+v", stIn)
 	}
 }
+
+func TestExitingFinalShellWithBackgroundJobDoesNotHang(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	runShellExit := func(t *testing.T, shellPath, bgCmd string) {
+		t.Helper()
+		fakeHome := filepath.Join(tmp, "home-"+filepath.Base(shellPath))
+		if err := os.MkdirAll(fakeHome, 0o755); err != nil {
+			t.Fatalf("mkdir home: %v", err)
+		}
+		cmd := exec.Command(bin, "--socket", sock, "new", "solo-"+filepath.Base(shellPath))
+		cmd.Env = append(os.Environ(),
+			"HOME="+fakeHome,
+			"SHELL="+shellPath,
+			"PS1=P$ ",
+			"TERM=xterm-256color",
+			"MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"),
+			"MPLEX_SESSION=",
+			"MPLEX_SESSION_ID=",
+			"MPLEX_SOCKET=",
+			"MPLEX_NO_UPDATE_CHECK=1",
+		)
+		ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 90})
+		if err != nil {
+			t.Fatalf("pty.StartWithSize: %v", err)
+		}
+		defer ptmx.Close()
+
+		var mu sync.Mutex
+		outer := vt.New(24, 90, 500)
+		outer.OnQueryReply = func(reply []byte) {
+			_, _ = ptmx.Write(reply)
+		}
+		go func() {
+			buf := make([]byte, 8192)
+			for {
+				n, err := ptmx.Read(buf)
+				if n > 0 {
+					mu.Lock()
+					outer.Write(buf[:n])
+					mu.Unlock()
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		waitSessionAttached(t, bin, sock, "solo-"+filepath.Base(shellPath))
+		_, _ = ptmx.Write([]byte(bgCmd + "\r"))
+		time.Sleep(150 * time.Millisecond)
+		_, _ = ptmx.Write([]byte("exit\r"))
+
+		doneCh := make(chan error, 1)
+		go func() { doneCh <- cmd.Wait() }()
+		select {
+		case err := <-doneCh:
+			if err != nil {
+				t.Fatalf("mplex exited with error after shell exit: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Fatalf("mplex hung after exiting final %s shell with background job", shellPath)
+		}
+	}
+
+	t.Run("sh", func(t *testing.T) {
+		runShellExit(t, "/bin/sh", "sleep 30 &")
+	})
+	if fishPath, err := exec.LookPath("fish"); err == nil {
+		t.Run("fish", func(t *testing.T) {
+			runShellExit(t, fishPath, "sleep 30 &; disown")
+		})
+	}
+}

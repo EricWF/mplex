@@ -175,6 +175,9 @@ func (d *Daemon) listSessions() []protocol.SessionInfo {
 
 	infos := make([]protocol.SessionInfo, 0, len(list))
 	for _, s := range list {
+		if s.IsExited() {
+			continue
+		}
 		infos = append(infos, s.Info())
 	}
 	sort.Slice(infos, func(i, j int) bool {

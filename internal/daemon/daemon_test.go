@@ -663,3 +663,71 @@ func TestPausedQueryAutoReplyAndStolenDetachEvent(t *testing.T) {
 
 	_, _ = c2.Kill("", true)
 }
+
+func TestSessionExitWithBackgroundDescendantHoldingPTY(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "mplex-bgexit-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "m.sock")
+
+	d := daemon.New(sock)
+	go func() {
+		_ = d.Start()
+	}()
+	defer d.Close()
+
+	outer := newOuterTermSink(24, 80)
+	var rc *client.RPCConn
+	waitFor(t, 2*time.Second, "daemon socket", func() bool {
+		c, err := client.Dial(sock, outer)
+		if err != nil {
+			return false
+		}
+		rc = c
+		return true
+	})
+	defer rc.Close()
+
+	sz := protocol.WinSize{Rows: 24, Cols: 80}
+	if _, err := rc.Hello(protocol.HelloReq{Size: sz, Term: "xterm-256color", Interactive: true}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+
+	// Start a shell that spawns a background sleep holding the slave PTY fd open,
+	// prints final output, and exits immediately with code 7.
+	sess, err := rc.Create(protocol.CreateReq{
+		Name: "bgtest",
+		Cmd:  []string{"/bin/sh", "-c", "sleep 30 & echo FINAL_OUTPUT_BEFORE_EXIT; exit 7"},
+		Size: sz,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := rc.Attach(protocol.AttachReq{Target: sess.ID, Size: sz, ReplayLines: 200}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	// Session MUST emit MsgSessionExited promptly (not hang for 30s!) and already
+	// be removed from rc.List() by the time MsgSessionExited is delivered.
+	select {
+	case ev := <-rc.SessionExitedCh:
+		if ev.SessionID != sess.ID || ev.ExitCode != 7 {
+			t.Fatalf("unexpected SessionExitedEvent: %+v", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("session hung on exit while background descendant held slave PTY open")
+	}
+
+	sessions, err := rc.List()
+	if err != nil {
+		t.Fatalf("List after exit: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("expected 0 sessions immediately after MsgSessionExited, got %+v", sessions)
+	}
+	if !outer.screenContains("FINAL_OUTPUT_BEFORE_EXIT") {
+		t.Fatalf("final output before exit was not drained to client")
+	}
+}
