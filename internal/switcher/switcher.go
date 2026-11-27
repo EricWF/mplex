@@ -28,9 +28,28 @@ const (
 
 // Result is returned when the interactive switcher closes.
 type Result struct {
-	Action  ActionKind
-	Target  string // Session ID (ActionSelect) or desired name (ActionCreate)
-	Literal []byte // Raw bytes to forward on ActionSendLiteral
+	Action       ActionKind
+	Target       string // Session ID (ActionSelect) or desired name (ActionCreate)
+	Literal      []byte // Raw bytes to forward on ActionSendLiteral
+	ForcedDetach bool   // true when client was explicitly detached externally while switcher was open
+	DaemonClosed bool   // true when daemon connection closed while switcher was open
+	Notice       string // optional reason for ForcedDetach
+}
+
+// ExternalEventKind describes an asynchronous event delivered while the switcher is open.
+type ExternalEventKind int
+
+const (
+	EventRefresh ExternalEventKind = iota
+	EventSessionLost // active session was stolen or exited while switcher was open
+	EventForceDetach // client was explicitly detached externally (e.g. `mplex detach`)
+	EventDaemonClosed
+)
+
+// ExternalEvent carries an asynchronous daemon/client state change into the open switcher.
+type ExternalEvent struct {
+	Kind   ExternalEventKind
+	Notice string
 }
 
 // Callbacks connects the switcher UI to live daemon RPCs.
@@ -59,6 +78,7 @@ type Config struct {
 	InputCh          <-chan []byte
 	ResizeCh         <-chan protocol.WinSize
 	RefreshCh        <-chan string
+	EventCh          <-chan ExternalEvent
 	Out              io.Writer
 	Callbacks        Callbacks
 }
@@ -98,14 +118,21 @@ func Run(cfg Config) Result {
 		cfg.Cols = 80
 	}
 
-	// Enter clean alt screen with SGR mouse enabled just for the switcher.
+	// Enter clean alt screen with SGR mouse enabled just for the switcher,
+	// resetting any active inner modes (mouse/focus/keypad/color-scheme/hyperlinks)
+	// that a shell or TUI (such as fish 4 or vim) may have left enabled.
 	_, _ = cfg.Out.Write([]byte(
 		"\x1b[?1049h" + // enter alt screen
 			"\x1b[?2026l" + // ensure sync off
+			"\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1015l\x1b[?1016l" + // reset other mouse/focus modes
 			"\x1b[?1000h\x1b[?1006h" + // SGR mouse click + scroll inside switcher
-			"\x1b[?2004l" + // disable bracketed paste inside switcher
+			"\x1b[?2004l\x1b[?2031l" + // disable bracketed paste & color-scheme notifications
+			"\x1b[?1l\x1b>" + // normal cursor & keypad
+			"\x1b[?6l\x1b[4l\x1b[20l\x1b[?7h" + // reset DECOM, IRM, LNM; enable wrap
+			"\x1b[r\x1b(B\x1b)B\x0f" + // reset scroll margins & charsets
 			"\x1b[<32u" + // clear Kitty keyboard stack inside switcher
 			"\x1b[>4;0m" +
+			"\x1b]8;;\x1b\\" + // close any open OSC 8 hyperlink
 			"\x1b[0 q" + // default cursor
 			"\x1b[0m\x1b[2J\x1b[H",
 	))
@@ -172,6 +199,57 @@ func Run(cfg Config) Result {
 			st.syncSelectionScroll()
 			st.ensurePreview()
 			st.render()
+
+		case ev, ok := <-cfg.EventCh:
+			if !ok {
+				continue
+			}
+			switch ev.Kind {
+			case EventDaemonClosed:
+				return Result{Action: ActionDetach, DaemonClosed: true}
+			case EventForceDetach:
+				return Result{Action: ActionDetach, ForcedDetach: true, Notice: ev.Notice}
+			case EventSessionLost:
+				lostID := st.cfg.CurrentSessionID
+				st.cfg.CurrentSessionID = ""
+				st.cfg.AllowCancel = false
+				st.cfg.ExitOnEsc = true
+				if st.mode == modeConfirmKill && st.killTarget.ID == lostID {
+					st.mode = modeBrowse
+				}
+				if ev.Notice != "" {
+					st.notice = ev.Notice
+				}
+				prevIsCreate := false
+				prevID := ""
+				if st.selected >= 0 && st.selected < len(st.entries) {
+					prevIsCreate = st.entries[st.selected].isCreate
+					if !prevIsCreate {
+						prevID = st.entries[st.selected].result.Session.ID
+					}
+				}
+				st.previewCache = make(map[string]previewCacheEntry)
+				st.reloadSessions()
+				st.rebuildEntries()
+				if prevID != "" && prevID != lostID {
+					st.restoreSelection(prevID, prevIsCreate)
+				} else if len(st.query) == 0 {
+					st.selectInitial()
+				}
+				st.syncSelectionScroll()
+				st.ensurePreview()
+				st.render()
+			case EventRefresh:
+				if ev.Notice != "" {
+					st.notice = ev.Notice
+				}
+				st.previewCache = make(map[string]previewCacheEntry)
+				st.reloadSessions()
+				st.rebuildEntries()
+				st.syncSelectionScroll()
+				st.ensurePreview()
+				st.render()
+			}
 
 		case <-tickCh:
 			if st.mode == modeBrowse && st.liveRefresh() {
@@ -836,6 +914,7 @@ func (st *state) handleRune(r rune) (Result, bool) {
 					delete(st.previewCache, st.killTarget.ID)
 					if st.killTarget.ID == st.cfg.CurrentSessionID {
 						st.cfg.AllowCancel = false
+						st.cfg.ExitOnEsc = true
 						st.cfg.CurrentSessionID = ""
 					}
 					st.reloadSessions()

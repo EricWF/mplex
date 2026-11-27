@@ -19,6 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/creack/pty"
 	"golang.org/x/term"
 
 	"github.com/EricWF/mplex/internal/client"
@@ -40,8 +41,20 @@ func currentVersion() string {
 	return "dev"
 }
 
+type silentExitError struct {
+	code int
+}
+
+func (e silentExitError) Error() string {
+	return ""
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		var exitErr silentExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.code)
+		}
 		fmt.Fprintf(os.Stderr, "mplex: %v\n", err)
 		os.Exit(1)
 	}
@@ -96,14 +109,14 @@ func run(args []string) error {
 
 	if cfgErr != nil {
 		switch sub {
-		case "__complete-sessions", "config", "completion", "version", "help", "-h", "--help":
+		case "__complete-sessions", "config", "completion", "status", "whoami", "version", "help", "-h", "--help":
 		default:
 			return cfgErr
 		}
 	}
 
 	switch sub {
-	case "__complete-sessions", "config", "completion", "version", "help", "-h", "--help":
+	case "__complete-sessions", "config", "completion", "status", "whoami", "version", "help", "-h", "--help":
 	default:
 		var err error
 		namingMode, err = normalizeNamingMode(namingMode)
@@ -120,6 +133,9 @@ func run(args []string) error {
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
+
+	case "status", "whoami":
+		return runStatusCmd(socketPath, rest)
 
 	case "config":
 		return runConfigCmd(eff, cfgErr, rest)
@@ -146,7 +162,7 @@ func run(args []string) error {
 		return runListCmd(socketPath, rest)
 
 	case "new", "n":
-		return runNewCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, rest)
+		return runNewCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, *nested, rest)
 
 	case "attach", "a":
 		return runAttachCmd(socketPath, keySpec, namingMode, scrollback, replayLines, windowTitle, *nested, rest)
@@ -299,7 +315,7 @@ func runListCmd(socketPath string, args []string) error {
 	return tw.Flush()
 }
 
-func runNewCmd(socketPath, keySpec, namingMode string, scrollback, replayLines int, windowTitle bool, args []string) error {
+func runNewCmd(socketPath, keySpec, namingMode string, scrollback, replayLines int, windowTitle, nested bool, args []string) error {
 	fs := flag.NewFlagSet("mplex new", flag.ContinueOnError)
 	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
 	fs.StringVar(&keySpec, "key", keySpec, "switcher trigger key")
@@ -369,6 +385,38 @@ func runNewCmd(socketPath, keySpec, namingMode string, scrollback, replayLines i
 		}
 		fmt.Printf("Created session %q (id=%s)\n", sess.Name, sess.ID)
 		return nil
+	}
+
+	// Inside an existing mplex session on the same socket, create the new session
+	// and switch the outer client directly instead of accidentally nesting mplex.
+	if !nested && os.Getenv("MPLEX_SESSION") != "" && os.Getenv("MPLEX_SOCKET") == socketPath {
+		rc, err := client.Dial(socketPath, nil)
+		if err != nil {
+			return fmt.Errorf("daemon not running: %w", err)
+		}
+		defer rc.Close()
+
+		sz := protocol.WinSize{Rows: 24, Cols: 80}
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			if ws, wsErr := pty.GetsizeFull(os.Stdin); wsErr == nil && ws.Rows > 0 && ws.Cols > 0 {
+				sz = protocol.WinSize{Rows: ws.Rows, Cols: ws.Cols, XPixel: ws.X, YPixel: ws.Y}
+			}
+		}
+		sess, err := rc.Create(protocol.CreateReq{
+			Name:       name,
+			Cwd:        startDir,
+			Shell:      os.Getenv("SHELL"),
+			Cmd:        cmdArgs,
+			Env:        os.Environ(),
+			Size:       sz,
+			Scrollback: scrollback,
+			NamingMode: namingMode,
+		})
+		if err != nil {
+			return err
+		}
+		_, err = rc.SwitchSession("", os.Getenv("MPLEX_SESSION_ID"), sess.ID)
+		return err
 	}
 
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
@@ -1116,6 +1164,103 @@ func runRenameCmd(socketPath string, args []string) error {
 	return nil
 }
 
+type statusResult struct {
+	InSession   bool                  `json:"in_session"`
+	SessionName string                `json:"session_name,omitempty"`
+	SessionID   string                `json:"session_id,omitempty"`
+	Socket      string                `json:"socket,omitempty"`
+	Stale       bool                  `json:"stale,omitempty"`
+	Session     *protocol.SessionInfo `json:"session,omitempty"`
+}
+
+func runStatusCmd(socketPath string, args []string) error {
+	fs := flag.NewFlagSet("mplex status", flag.ContinueOnError)
+	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
+	quietShort := fs.Bool("q", false, "suppress output; exit 0 if inside an mplex session, 1 otherwise")
+	quietLong := fs.Bool("quiet", false, "suppress output; exit 0 if inside an mplex session, 1 otherwise")
+	nameOnly := fs.Bool("name", false, "print only the current session name")
+	jsonOut := fs.Bool("json", false, "output session status as JSON")
+
+	parseArgs, _ := reorderFlagsBeforeDash(args, map[string]bool{"socket": true})
+	if err := fs.Parse(parseArgs); err != nil {
+		return err
+	}
+	quiet := *quietShort || *quietLong
+
+	envSession := os.Getenv("MPLEX_SESSION")
+	envSessionID := os.Getenv("MPLEX_SESSION_ID")
+	envSocket := os.Getenv("MPLEX_SOCKET")
+
+	emit := func(res statusResult) error {
+		if *jsonOut {
+			if err := writeJSON(res); err != nil {
+				return err
+			}
+		} else if !quiet {
+			if res.InSession {
+				if *nameOnly {
+					fmt.Println(res.SessionName)
+				} else {
+					fmt.Printf("In mplex session %q (id=%s, socket=%s)\n", res.SessionName, res.SessionID, res.Socket)
+				}
+			} else if !*nameOnly {
+				if res.Stale {
+					label := envSession
+					if label == "" {
+						label = envSessionID
+					}
+					fmt.Printf("Not in an active mplex session (stale MPLEX_SESSION=%q).\n", label)
+				} else {
+					fmt.Println("Not in an mplex session.")
+				}
+			}
+		}
+		if !res.InSession {
+			return silentExitError{code: 1}
+		}
+		return nil
+	}
+
+	if envSession == "" && envSessionID == "" {
+		return emit(statusResult{InSession: false})
+	}
+
+	targetSock := socketPath
+	if targetSock == "" {
+		targetSock = envSocket
+	}
+	if envSocket != "" && targetSock != envSocket {
+		return emit(statusResult{InSession: false})
+	}
+
+	// Verify against the live daemon and resolve any post-creation session rename.
+	rc, err := client.Dial(targetSock, nil)
+	if err != nil {
+		return emit(statusResult{InSession: false, Stale: true, Socket: targetSock})
+	}
+	defer rc.Close()
+
+	sessions, err := rc.List()
+	if err != nil {
+		return emit(statusResult{InSession: false, Stale: true, Socket: targetSock})
+	}
+	for i := range sessions {
+		s := sessions[i]
+		if (envSessionID != "" && s.ID == envSessionID) || (envSessionID == "" && envSession != "" && s.Name == envSession) {
+			sessCopy := s
+			return emit(statusResult{
+				InSession:   true,
+				SessionName: s.Name,
+				SessionID:   s.ID,
+				Socket:      targetSock,
+				Session:     &sessCopy,
+			})
+		}
+	}
+
+	return emit(statusResult{InSession: false, Stale: true, Socket: targetSock})
+}
+
 func runDetachCmd(socketPath string, args []string) error {
 	fs := flag.NewFlagSet("mplex detach", flag.ContinueOnError)
 	fs.StringVar(&socketPath, "socket", socketPath, "daemon Unix socket path")
@@ -1193,6 +1338,7 @@ Usage:
   mplex attach [name] [--create] [--pick]   Attach to an existing session (switches outer window if inside mplex)
   mplex switch [name] [--client id] [--json] Open switcher or switch an active window directly to <name>
   mplex list [--json]                       List active sessions
+  mplex status [-q|--name|--json]           Check whether the current shell is inside an mplex session (exits 0 if yes, 1 if no)
   mplex capture <name> [flags]              Read a session's screen/scrollback (--lines, --scrollback, --ansi, -f/--follow, --json)
   mplex follow <name> [flags]               Stream live read-only output from a session (--history, --lines)
   mplex wait <name> [flags]                 Wait for a session condition (--match, --idle, --exit, --scrollback, --timeout, --json)

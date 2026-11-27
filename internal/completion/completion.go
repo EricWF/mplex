@@ -106,6 +106,8 @@ complete -c mplex -n __mplex_needs_command -a new -d 'Create a new session'
 complete -c mplex -n __mplex_needs_command -a attach -d 'Attach to an existing session'
 complete -c mplex -n __mplex_needs_command -a switch -d 'Open switcher or switch active window'
 complete -c mplex -n __mplex_needs_command -a list -d 'List active sessions'
+complete -c mplex -n __mplex_needs_command -a status -d 'Check if current shell is inside an mplex session'
+complete -c mplex -n __mplex_needs_command -a whoami -d 'Check if current shell is inside an mplex session'
 complete -c mplex -n __mplex_needs_command -a capture -d 'Read session screen or scrollback'
 complete -c mplex -n __mplex_needs_command -a read -d 'Read session screen or scrollback'
 complete -c mplex -n __mplex_needs_command -a logs -d 'Read session screen or scrollback'
@@ -150,6 +152,12 @@ complete -c mplex -n '__mplex_using_command switch s pick' -a '(__mplex_sessions
 # list
 complete -c mplex -n '__mplex_using_command list ls' -l json -d 'Output sessions as JSON'
 complete -c mplex -n '__mplex_using_command list ls' -l socket -r -F -d 'Daemon Unix socket path'
+
+# status
+complete -c mplex -n '__mplex_using_command status whoami' -s q -l quiet -d 'Suppress output and signal via exit code'
+complete -c mplex -n '__mplex_using_command status whoami' -l name -d 'Print only the current session name'
+complete -c mplex -n '__mplex_using_command status whoami' -l json -d 'Output status as JSON'
+complete -c mplex -n '__mplex_using_command status whoami' -l socket -r -F -d 'Daemon Unix socket path'
 
 # capture / read / logs
 complete -c mplex -n '__mplex_using_command capture read logs' -s f -l follow -d 'Stream live output continuously (read-only)'
@@ -285,6 +293,8 @@ _mplex() {
         'attach:Attach to an existing session'
         'switch:Open switcher or switch active window'
         'list:List active sessions'
+        'status:Check if current shell is inside an mplex session'
+        'whoami:Check if current shell is inside an mplex session'
         'capture:Read session screen or scrollback'
         'read:Read session screen or scrollback'
         'logs:Read session screen or scrollback'
@@ -353,6 +363,13 @@ _mplex() {
                 list|ls)
                     _arguments \
                         '--json[Output sessions as JSON]' \
+                        '--socket=[Daemon Unix socket path]:socket file:_files'
+                    ;;
+                status|whoami)
+                    _arguments \
+                        '(-q --quiet)'{-q,--quiet}'[Suppress output and signal via exit code]' \
+                        '--name[Print only the current session name]' \
+                        '--json[Output status as JSON]' \
                         '--socket=[Daemon Unix socket path]:socket file:_files'
                     ;;
                 capture|read|logs)
@@ -538,7 +555,7 @@ _mplex_completions() {
     esac
 
     local global_flags="--socket --key --scrollback --replay-lines --window-title --naming --pick --nested --version --help"
-    local commands="new attach switch list capture read logs send follow wait mcp rename kill detach save restore config completion update version help"
+    local commands="new attach switch list status whoami capture read logs send follow wait mcp rename kill detach save restore config completion update version help"
 
     local sessions=""
     _mplex_load_sessions() {
@@ -577,6 +594,9 @@ _mplex_completions() {
             ;;
         list|ls)
             flags="--json --socket"
+            ;;
+        status|whoami)
+            flags="-q --quiet --name --json --socket"
             ;;
         capture|read|logs)
             flags="-f --follow --lines --scrollback --ansi --raw-wrap --json --socket"

@@ -63,6 +63,11 @@ type Terminal struct {
 	CachedDA1   string
 	CachedDA2   string
 
+	// PendingDA1 tracks whether a DA1 query (CSI 0 c / CSI c) was emitted while
+	// OnQueryReply was nil (i.e. forwarded to an attached outer terminal) and has
+	// not yet been answered via SnoopClientInput.
+	PendingDA1 bool
+
 	// Generation counter incremented on every Write (lets client skip replay if unchanged)
 	Generation uint64
 	// BellCount is incremented whenever a BEL (0x07) control character is executed.
@@ -137,11 +142,21 @@ func (t *Terminal) Resize(rows, cols int) {
 // to the PTY (while attached) to cache color/DA replies for future detached queries.
 // Never modifies or blocks the byte stream.
 func (t *Terminal) SnoopClientInput(data []byte) {
+	if len(data) < 5 {
+		return
+	}
+	s := string(data)
+	// Snoop DA1 replies: \x1b[?<digits/semicolons>c
+	if idx := strings.Index(s, "\x1b[?"); idx >= 0 {
+		if da, ok := parseDA1Reply(s[idx:]); ok {
+			t.CachedDA1 = da
+			t.PendingDA1 = false
+		}
+	}
 	// Quick scan for OSC 10/11 color responses: \x1b]10;rgb:...\x07 or \x1b\\
 	if len(data) < 8 {
 		return
 	}
-	s := string(data)
 	if idx := strings.Index(s, "\x1b]10;"); idx >= 0 {
 		if end := findOscEnd(s[idx+5:]); end > 0 {
 			val := s[idx+5 : idx+5+end]
@@ -158,6 +173,37 @@ func (t *Terminal) SnoopClientInput(data []byte) {
 			}
 		}
 	}
+}
+
+func parseDA1Reply(s string) (string, bool) {
+	if !strings.HasPrefix(s, "\x1b[?") || len(s) < 5 {
+		return "", false
+	}
+	hasDigit := false
+	for i := 3; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+			continue
+		}
+		if c == ';' {
+			continue
+		}
+		if c == 'c' && hasDigit {
+			return s[:i+1], true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// DefaultDA1Reply returns the cached DA1 reply from the real outer terminal,
+// or a safe VT220 fallback if none has been observed yet.
+func (t *Terminal) DefaultDA1Reply() string {
+	if t.CachedDA1 != "" {
+		return t.CachedDA1
+	}
+	return "\x1b[?62;22c"
 }
 
 func findOscEnd(s string) int {
@@ -682,10 +728,11 @@ func (t *Terminal) csiDispatch(private byte, intermediates []byte, params *CSIPa
 		}
 	case 'c': // DA1 - Primary Device Attributes
 		if params.Get(0, 0) == 0 {
-			if t.CachedDA1 != "" {
-				t.reply(t.CachedDA1)
+			if t.OnQueryReply != nil {
+				t.PendingDA1 = false
+				t.reply(t.DefaultDA1Reply())
 			} else {
-				t.reply("\x1b[?62;22c")
+				t.PendingDA1 = true
 			}
 		}
 	case 'd': // VPA - Vertical Line Position Absolute

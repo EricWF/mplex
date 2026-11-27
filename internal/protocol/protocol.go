@@ -301,7 +301,10 @@ type SessionExitedEvent struct {
 }
 
 type DetachedEvent struct {
-	Reason string `json:"reason,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Stolen      bool   `json:"stolen,omitempty"`
+	SessionID   string `json:"session_id,omitempty"`
+	SessionName string `json:"session_name,omitempty"`
 }
 
 type RestoreReq struct {

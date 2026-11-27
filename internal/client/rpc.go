@@ -129,6 +129,21 @@ func (rc *RPCConn) WriteStdoutRaw(p []byte) {
 	rc.outMu.Unlock()
 }
 
+type rawStdoutWriter struct {
+	rc *RPCConn
+}
+
+func (w rawStdoutWriter) Write(p []byte) (int, error) {
+	w.rc.WriteStdoutRaw(p)
+	return len(p), nil
+}
+
+// StdoutWriter returns an io.Writer serialized under the same mutex as live
+// stdout/replay frames so switcher frames never interleave with daemon output.
+func (rc *RPCConn) StdoutWriter() io.Writer {
+	return rawStdoutWriter{rc: rc}
+}
+
 // SetWindowTitleEnabled toggles automatic OSC 0 outer window title tagging
 // after attach/switch/restore replays and on explicit UpdateWindowTitle calls.
 func (rc *RPCConn) SetWindowTitleEnabled(enabled bool) {

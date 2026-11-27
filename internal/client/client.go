@@ -244,129 +244,319 @@ func RunInteractive(opts Options) error {
 	}
 
 	runSwitcher := func(sopt switcherOpts) (exitClient bool, err error) {
-		inSwitcher.Store(true)
-		startStdinReader()
-		rc.SetSuppressOutput(true)
-		if hasSession {
-			_ = rc.Pause(true)
-		}
-
-		// Drain stale switcher resize notifications before opening.
-		drainWinSizes(switcherResizeCh)
-		drainStrings(switcherRefreshCh)
-
-		defaultCwd := opts.CreateCwd
-		if hasSession && currentSession.Cwd != "" {
-			defaultCwd = currentSession.Cwd
-		} else if defaultCwd == "" {
-			defaultCwd, _ = os.Getwd()
-		}
-
-		s := getSize()
-		res := switcher.Run(switcher.Config{
-			CurrentSessionID: currentSession.ID,
-			LastSessionID:    lastSessionID,
-			TriggerLabel:     opts.Trigger.Label,
-			Notice:           sopt.notice,
-			DefaultCwd:       defaultCwd,
-			Rows:             int(s.Rows),
-			Cols:             int(s.Cols),
-			AllowCancel:      sopt.allowCancel && hasSession,
-			PreferCreate:     sopt.preferCreate,
-			ExitOnEsc:        sopt.exitOnEsc,
-			InputCh:          switcherInputCh,
-			ResizeCh:         switcherResizeCh,
-			RefreshCh:        switcherRefreshCh,
-			Out:              os.Stdout,
-			Callbacks: switcher.Callbacks{
-				ListSessions:       rc.List,
-				GetPreview:         rc.Preview,
-				GetPreviewScrolled: rc.PreviewScrolled,
-				KillSession: func(target string) error {
-					_, err := rc.Kill(target, false)
-					return err
-				},
-				Rename: func(target, newName string) (protocol.SessionInfo, error) {
-					sess, err := rc.Rename(target, newName)
-					if err == nil && hasSession && sess.ID == currentSession.ID {
-						currentSession = sess
-						rc.UpdateWindowTitle(sess.Name, sess.Title)
-					}
-					return sess, err
-				},
-				MatchTrigger: func(chunk []byte) ([]byte, bool) {
-					before, matched, after, ok := opts.Trigger.Match(chunk)
-					if ok && len(before) == 0 && len(after) == 0 {
-						return matched, true
-					}
-					return nil, false
-				},
-			},
-		})
-
-		// If the user killed the currently attached session inside the switcher,
-		// mark hasSession = false.
-		if res.Action == switcher.ActionCancel && !hasSession {
-			res.Action = switcher.ActionDetach
-		}
-
-		switch res.Action {
-		case switcher.ActionCancel, switcher.ActionSendLiteral:
-			dropped := rc.ConsumeDroppedFlag()
-			rc.SetSuppressOutput(false)
-			inSwitcher.Store(false)
-			restResp, err := rc.Restore(protocol.RestoreReq{
-				Size:        getSize(),
-				ReplayLines: opts.ReplayLines,
-				ForceReplay: dropped,
-			})
-			if err != nil {
-				// Current session may have exited while switcher was open!
-				hasSession = false
-				return false, nil
-			}
-			if restResp.Session != nil {
-				currentSession = *restResp.Session
-			}
-			if res.Action == switcher.ActionSendLiteral {
-				lit := sopt.openedWith
-				if len(lit) == 0 {
-					lit = res.Literal
-				}
-				if len(lit) > 0 {
-					_ = rc.SendStdin(lit)
-				}
-			}
-			return false, nil
-
-		case switcher.ActionSelect:
-			inSwitcher.Store(false)
-			if err := attachSession(res.Target); err != nil {
-				if !hasSession {
-					return true, err
-				}
-				return false, nil
-			}
-			return false, nil
-
-		case switcher.ActionCreate:
-			inSwitcher.Store(false)
-			if err := createAndAttach(res.Target, defaultCwd, nil); err != nil {
-				return false, err
-			}
-			return false, nil
-
-		case switcher.ActionDetach:
-			inSwitcher.Store(false)
+		for {
+			inSwitcher.Store(true)
+			startStdinReader()
+			rc.SetSuppressOutput(true)
 			if hasSession {
-				_ = rc.Detach("", "")
-				exitMessage = "mplex: detached"
+				_ = rc.Pause(true)
 			}
-			return true, nil
-		}
 
-		inSwitcher.Store(false)
-		return false, nil
+			// Drain stale switcher resize notifications before opening.
+			drainWinSizes(switcherResizeCh)
+			drainStrings(switcherRefreshCh)
+
+			defaultCwd := opts.CreateCwd
+			if hasSession && currentSession.Cwd != "" {
+				defaultCwd = currentSession.Cwd
+			} else if defaultCwd == "" {
+				defaultCwd, _ = os.Getwd()
+			}
+
+			// Forward async daemon events (stolen/exited/forced-detach/disconnect)
+			// into the open switcher so the UI updates live and never freezes.
+			eventCh := make(chan switcher.ExternalEvent, 8)
+			stopForward := make(chan struct{})
+			forwardDone := make(chan struct{})
+			var (
+				sessionLost        atomic.Bool
+				killedCurrent      atomic.Bool
+				lostNoticeMu       sync.Mutex
+				lostNotice         string
+				forcedDetachReason string
+				daemonDisconnected atomic.Bool
+				termSigReceived    atomic.Bool
+			)
+			trackedSessID := ""
+			trackedSessName := ""
+			if hasSession {
+				trackedSessID = currentSession.ID
+				trackedSessName = currentSession.Name
+			}
+			go func() {
+				defer close(forwardDone)
+				for {
+					select {
+					case <-stopForward:
+						return
+					case <-termSigCh:
+						termSigReceived.Store(true)
+						select {
+						case eventCh <- switcher.ExternalEvent{Kind: switcher.EventForceDetach}:
+						default:
+						}
+						return
+					case <-rc.Done():
+						daemonDisconnected.Store(true)
+						select {
+						case eventCh <- switcher.ExternalEvent{Kind: switcher.EventDaemonClosed}:
+						default:
+						}
+						return
+					case ev := <-rc.DetachedCh:
+						if !isStolenDetach(ev) {
+							msg := "mplex: detached"
+							if ev.Reason != "" {
+								msg = "mplex: " + ev.Reason
+							}
+							lostNoticeMu.Lock()
+							forcedDetachReason = msg
+							lostNoticeMu.Unlock()
+							select {
+							case eventCh <- switcher.ExternalEvent{Kind: switcher.EventForceDetach, Notice: msg}:
+							default:
+							}
+							return
+						}
+						if trackedSessID != "" && ev.SessionID != "" && ev.SessionID != trackedSessID {
+							continue
+						}
+						notice := stolenNotice(ev, trackedSessName)
+						sessionLost.Store(true)
+						lostNoticeMu.Lock()
+						lostNotice = notice
+						lostNoticeMu.Unlock()
+						if opts.WindowTitle {
+							rc.WriteStdoutRaw([]byte("\x1b]0;\x07"))
+						}
+						select {
+						case eventCh <- switcher.ExternalEvent{Kind: switcher.EventSessionLost, Notice: notice}:
+						default:
+						}
+					case ev := <-rc.SessionExitedCh:
+						if trackedSessID == "" || ev.SessionID != trackedSessID {
+							continue
+						}
+						notice := fmt.Sprintf("Session %q exited (code %d)", ev.SessionName, ev.ExitCode)
+						sessionLost.Store(true)
+						lostNoticeMu.Lock()
+						lostNotice = notice
+						lostNoticeMu.Unlock()
+						if opts.WindowTitle {
+							rc.WriteStdoutRaw([]byte("\x1b]0;\x07"))
+						}
+						select {
+						case eventCh <- switcher.ExternalEvent{Kind: switcher.EventSessionLost, Notice: notice}:
+						default:
+						}
+					}
+				}
+			}()
+
+			s := getSize()
+			res := switcher.Run(switcher.Config{
+				CurrentSessionID: currentSession.ID,
+				LastSessionID:    lastSessionID,
+				TriggerLabel:     opts.Trigger.Label,
+				Notice:           sopt.notice,
+				DefaultCwd:       defaultCwd,
+				Rows:             int(s.Rows),
+				Cols:             int(s.Cols),
+				AllowCancel:      sopt.allowCancel && hasSession,
+				PreferCreate:     sopt.preferCreate,
+				ExitOnEsc:        sopt.exitOnEsc,
+				InputCh:          switcherInputCh,
+				ResizeCh:         switcherResizeCh,
+				RefreshCh:        switcherRefreshCh,
+				EventCh:          eventCh,
+				Out:              rc.StdoutWriter(),
+				Callbacks: switcher.Callbacks{
+					ListSessions:       rc.List,
+					GetPreview:         rc.Preview,
+					GetPreviewScrolled: rc.PreviewScrolled,
+					KillSession: func(target string) error {
+						_, err := rc.Kill(target, false)
+						if err == nil && trackedSessID != "" && target == trackedSessID {
+							killedCurrent.Store(true)
+						}
+						return err
+					},
+					Rename: func(target, newName string) (protocol.SessionInfo, error) {
+						sess, err := rc.Rename(target, newName)
+						if err == nil && hasSession && sess.ID == currentSession.ID {
+							currentSession = sess
+							rc.UpdateWindowTitle(sess.Name, sess.Title)
+						}
+						return sess, err
+					},
+					MatchTrigger: func(chunk []byte) ([]byte, bool) {
+						before, matched, after, ok := opts.Trigger.Match(chunk)
+						if ok && len(before) == 0 && len(after) == 0 {
+							return matched, true
+						}
+						return nil, false
+					},
+				},
+			})
+
+			close(stopForward)
+			<-forwardDone
+
+			if termSigReceived.Load() {
+				inSwitcher.Store(false)
+				rc.WriteStdoutRaw([]byte("\x1b[?1049l"))
+				if hasSession {
+					_ = rc.Detach("", "")
+				}
+				return true, nil
+			}
+			if res.DaemonClosed || daemonDisconnected.Load() {
+				inSwitcher.Store(false)
+				rc.WriteStdoutRaw([]byte("\x1b[?1049l"))
+				exitMessage = "mplex: daemon disconnected"
+				return true, nil
+			}
+			if res.ForcedDetach {
+				inSwitcher.Store(false)
+				rc.WriteStdoutRaw([]byte("\x1b[?1049l"))
+				exitMessage = res.Notice
+				if exitMessage == "" {
+					exitMessage = "mplex: detached"
+				}
+				return true, nil
+			}
+			lostNoticeMu.Lock()
+			fdReason := forcedDetachReason
+			lNotice := lostNotice
+			lostNoticeMu.Unlock()
+			if fdReason != "" {
+				inSwitcher.Store(false)
+				rc.WriteStdoutRaw([]byte("\x1b[?1049l"))
+				exitMessage = fdReason
+				return true, nil
+			}
+
+			if sessionLost.Load() || killedCurrent.Load() {
+				if hasSession {
+					lastSessionID = currentSession.ID
+				}
+				hasSession = false
+				currentSession = protocol.SessionInfo{}
+			}
+
+			// If the active session was killed/stolen/exited while switcher was open,
+			// never try to restore a gone session.
+			if res.Action == switcher.ActionCancel && !hasSession {
+				if lNotice != "" {
+					sopt = switcherOpts{
+						notice:       lNotice,
+						allowCancel:  false,
+						preferCreate: true,
+						exitOnEsc:    true,
+					}
+					continue
+				}
+				res.Action = switcher.ActionDetach
+			}
+
+			switch res.Action {
+			case switcher.ActionCancel, switcher.ActionSendLiteral:
+				dropped := rc.ConsumeDroppedFlag()
+				rc.SetSuppressOutput(false)
+				inSwitcher.Store(false)
+				restResp, err := rc.Restore(protocol.RestoreReq{
+					Size:        getSize(),
+					ReplayLines: opts.ReplayLines,
+					ForceReplay: dropped,
+				})
+				if err != nil {
+					// Current session was stolen or exited right before Restore;
+					// drop back into the switcher menu instead of freezing.
+					if hasSession {
+						lastSessionID = currentSession.ID
+					}
+					hasSession = false
+					currentSession = protocol.SessionInfo{}
+					notice := lNotice
+					if notice == "" {
+						select {
+						case ev := <-rc.DetachedCh:
+							if !isStolenDetach(ev) {
+								if ev.Reason != "" {
+									exitMessage = "mplex: " + ev.Reason
+								} else {
+									exitMessage = "mplex: detached"
+								}
+								return true, nil
+							}
+							notice = stolenNotice(ev, trackedSessName)
+						case ev := <-rc.SessionExitedCh:
+							notice = fmt.Sprintf("Session %q exited (code %d)", ev.SessionName, ev.ExitCode)
+						default:
+							notice = "Session is no longer active"
+						}
+					}
+					sopt = switcherOpts{
+						notice:       notice,
+						allowCancel:  false,
+						preferCreate: true,
+						exitOnEsc:    true,
+					}
+					continue
+				}
+				if restResp.Session != nil {
+					currentSession = *restResp.Session
+				}
+				if res.Action == switcher.ActionSendLiteral {
+					lit := sopt.openedWith
+					if len(lit) == 0 {
+						lit = res.Literal
+					}
+					if len(lit) > 0 {
+						_ = rc.SendStdin(lit)
+					}
+				}
+				return false, nil
+
+			case switcher.ActionSelect:
+				inSwitcher.Store(false)
+				if err := attachSession(res.Target); err != nil {
+					sopt = switcherOpts{
+						notice:       "Could not attach: " + err.Error(),
+						allowCancel:  hasSession,
+						preferCreate: !hasSession,
+						exitOnEsc:    !hasSession,
+					}
+					continue
+				}
+				return false, nil
+
+			case switcher.ActionCreate:
+				inSwitcher.Store(false)
+				if err := createAndAttach(res.Target, defaultCwd, nil); err != nil {
+					sopt = switcherOpts{
+						notice:       "Could not create session: " + err.Error(),
+						allowCancel:  hasSession,
+						preferCreate: !hasSession,
+						exitOnEsc:    !hasSession,
+					}
+					continue
+				}
+				return false, nil
+
+			case switcher.ActionDetach:
+				inSwitcher.Store(false)
+				rc.WriteStdoutRaw([]byte("\x1b[?1049l"))
+				if hasSession {
+					_ = rc.Detach("", "")
+					exitMessage = "mplex: detached"
+				}
+				return true, nil
+			}
+
+			inSwitcher.Store(false)
+			return false, nil
+		}
 	}
 
 	// --- Initial startup behavior ---
@@ -459,12 +649,37 @@ func RunInteractive(opts Options) error {
 			return err
 
 		case ev := <-rc.DetachedCh:
-			if ev.Reason != "" {
-				exitMessage = "mplex: " + ev.Reason
-			} else {
-				exitMessage = "mplex: detached"
+			if !isStolenDetach(ev) {
+				if ev.Reason != "" {
+					exitMessage = "mplex: " + ev.Reason
+				} else {
+					exitMessage = "mplex: detached"
+				}
+				return nil
 			}
-			return nil
+			// Ignore stale detach events for a session we already switched away from.
+			if hasSession && ev.SessionID != "" && ev.SessionID != currentSession.ID {
+				continue
+			}
+			prevName := currentSession.Name
+			if hasSession {
+				lastSessionID = currentSession.ID
+			}
+			hasSession = false
+			currentSession = protocol.SessionInfo{}
+			if opts.WindowTitle {
+				rc.WriteStdoutRaw([]byte("\x1b]0;\x07"))
+			}
+			notice := stolenNotice(ev, prevName)
+			exitClient, err := runSwitcher(switcherOpts{
+				notice:       notice,
+				allowCancel:  false,
+				preferCreate: true,
+				exitOnEsc:    true,
+			})
+			if err != nil || exitClient {
+				return err
+			}
 
 		case matched := <-triggerOpenCh:
 			exitClient, err := runSwitcher(switcherOpts{allowCancel: true, openedWith: matched})
@@ -480,7 +695,16 @@ func RunInteractive(opts Options) error {
 
 		case ev := <-rc.SwitchSessionCh:
 			if ev.Target != "" && (!hasSession || ev.Target != currentSession.ID) {
-				_ = attachSession(ev.Target)
+				if err := attachSession(ev.Target); err != nil && !hasSession {
+					exitClient, swErr := runSwitcher(switcherOpts{
+						notice:       "Could not switch session: " + err.Error(),
+						preferCreate: true,
+						exitOnEsc:    true,
+					})
+					if swErr != nil || exitClient {
+						return swErr
+					}
+				}
 			}
 
 		case ev := <-rc.SessionExitedCh:
@@ -489,10 +713,14 @@ func RunInteractive(opts Options) error {
 				continue
 			}
 			hasSession = false
+			currentSession = protocol.SessionInfo{}
 			sessions, err := rc.List()
 			if err != nil || len(sessions) == 0 {
 				exitMessage = fmt.Sprintf("mplex: session %q exited (code %d)", ev.SessionName, ev.ExitCode)
 				return nil
+			}
+			if opts.WindowTitle {
+				rc.WriteStdoutRaw([]byte("\x1b]0;\x07"))
 			}
 			notice := fmt.Sprintf("Session %q exited (code %d)", ev.SessionName, ev.ExitCode)
 			exitClient, err := runSwitcher(switcherOpts{notice: notice, exitOnEsc: true})
@@ -501,6 +729,24 @@ func RunInteractive(opts Options) error {
 			}
 		}
 	}
+}
+
+func isStolenDetach(ev protocol.DetachedEvent) bool {
+	return ev.Stolen || strings.Contains(ev.Reason, "attached by another client")
+}
+
+func stolenNotice(ev protocol.DetachedEvent, fallbackName string) string {
+	name := ev.SessionName
+	if name == "" {
+		name = fallbackName
+	}
+	if name != "" {
+		return fmt.Sprintf("Session %q attached by another client", name)
+	}
+	if ev.Reason != "" {
+		return ev.Reason
+	}
+	return "Session attached by another client"
 }
 
 func readWinSize(f *os.File) protocol.WinSize {

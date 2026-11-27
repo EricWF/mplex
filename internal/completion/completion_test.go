@@ -7,7 +7,7 @@ import (
 )
 
 var expectedSubcommands = []string{
-	"new", "attach", "switch", "list",
+	"new", "attach", "switch", "list", "status",
 	"capture", "read", "logs", "send", "follow", "wait", "mcp",
 	"rename", "kill", "detach",
 	"save", "restore", "config", "completion",

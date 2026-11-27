@@ -254,6 +254,43 @@ func TestDetachedQueryResponder(t *testing.T) {
 	}
 }
 
+func TestPendingDA1AndSnoopDA1Reply(t *testing.T) {
+	term := New(24, 80, 100)
+	// Attached mode (OnQueryReply == nil): DA1 query marks PendingDA1.
+	term.Write([]byte("\x1b[0c"))
+	if !term.PendingDA1 {
+		t.Fatalf("expected PendingDA1=true after CSI 0 c with nil OnQueryReply")
+	}
+
+	// Unrelated CSI input (e.g. SGR mouse) must not clear PendingDA1 or poison CachedDA1.
+	term.SnoopClientInput([]byte("\x1b[<0;12;5M"))
+	if !term.PendingDA1 || term.CachedDA1 != "" {
+		t.Fatalf("unexpected DA1 state after mouse input: pending=%v cached=%q", term.PendingDA1, term.CachedDA1)
+	}
+
+	// Short 5-byte DA1 reply (\x1b[?6c) or 7-byte (\x1b[?1;2c) must be snooped and clear PendingDA1.
+	term.SnoopClientInput([]byte("\x1b[?1;2c"))
+	if term.PendingDA1 {
+		t.Fatalf("expected PendingDA1=false after DA1 reply")
+	}
+	if term.CachedDA1 != "\x1b[?1;2c" {
+		t.Fatalf("CachedDA1 = %q, want \\x1b[?1;2c", term.CachedDA1)
+	}
+	if got := term.DefaultDA1Reply(); got != "\x1b[?1;2c" {
+		t.Fatalf("DefaultDA1Reply() = %q, want \\x1b[?1;2c", got)
+	}
+
+	// Short 5-byte DA1 reply also parsed cleanly.
+	term.Write([]byte("\x1b[c"))
+	if !term.PendingDA1 {
+		t.Fatalf("expected PendingDA1=true after CSI c")
+	}
+	term.SnoopClientInput([]byte("\x1b[?6c"))
+	if term.PendingDA1 || term.CachedDA1 != "\x1b[?6c" {
+		t.Fatalf("short DA1 not snooped: pending=%v cached=%q", term.PendingDA1, term.CachedDA1)
+	}
+}
+
 func TestOSC7CwdAndAPCGraphicsIgnoredCleanly(t *testing.T) {
 	term := New(10, 40, 100)
 	// Include a Kitty graphics APC payload + OSC 7 CWD + normal text.

@@ -20,9 +20,12 @@ func ResetOuterModes(exitAltScreen bool) []byte {
 	buf.WriteString("\x1b[?1004l")                         // disable focus events
 	buf.WriteString("\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l") // disable mouse encodings
 	buf.WriteString("\x1b[?2004l")                         // disable bracketed paste
+	buf.WriteString("\x1b[?2031l")                         // disable color scheme notifications (e.g. fish 4)
 	buf.WriteString("\x1b[?1l\x1b>")                       // normal cursor & keypad
 	buf.WriteString("\x1b[?6l\x1b[4l\x1b[20l")             // reset DECOM, IRM, LNM
 	buf.WriteString("\x1b[?7h")                            // enable DECAWM
+	buf.WriteString("\x1b[r")                              // reset scroll margins
+	buf.WriteString("\x1b(B\x1b)B\x0f")                    // reset charsets to ASCII G0
 	buf.WriteString("\x1b[<32u")                           // clear Kitty keyboard stack
 	buf.WriteString("\x1b[>4;0m")                          // reset modifyOtherKeys
 	buf.WriteString("\x1b]8;;\x1b\\")                      // close any open OSC 8 hyperlink

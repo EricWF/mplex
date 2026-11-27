@@ -567,3 +567,99 @@ func TestUnreadOutputBellTrackingAndScrolledPreview(t *testing.T) {
 
 	_, _ = cli.Kill("", true)
 }
+
+func TestPausedQueryAutoReplyAndStolenDetachEvent(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "mplex-dq-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "m.sock")
+
+	d := daemon.New(sock)
+	go func() {
+		_ = d.Start()
+	}()
+	defer d.Close()
+
+	outer1 := newOuterTermSink(24, 80)
+	var c1 *client.RPCConn
+	waitFor(t, 2*time.Second, "daemon socket", func() bool {
+		c, err := client.Dial(sock, outer1)
+		if err != nil {
+			return false
+		}
+		c1 = c
+		return true
+	})
+	defer c1.Close()
+
+	sz := protocol.WinSize{Rows: 24, Cols: 80}
+	if _, err := c1.Hello(protocol.HelloReq{Size: sz, Term: "xterm-256color", Interactive: true}); err != nil {
+		t.Fatalf("c1 hello: %v", err)
+	}
+
+	// Shell script that emits DA1 (\x1b[0c) and blocks reading stdin until a 'c' arrives,
+	// mimicking fish 4's blocking DA1 terminal capability query.
+	script := `stty -icanon min 1 time 0 -echo; echo READY_SCRIPT; read -r line; printf '\033[0c'; while :; do ch=$(dd bs=1 count=1 2>/dev/null); [ "$ch" = "c" ] && break; done; echo DA1_UNBLOCKED; exec cat`
+	sess, err := c1.Create(protocol.CreateReq{
+		Name: "foo",
+		Cmd:  []string{"/bin/sh", "-c", script},
+		Size: sz,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c1.Attach(protocol.AttachReq{Target: sess.ID, Size: sz, ReplayLines: 200}); err != nil {
+		t.Fatalf("c1 attach: %v", err)
+	}
+	waitFor(t, 2*time.Second, "script ready", func() bool {
+		return outer1.screenContains("READY_SCRIPT")
+	})
+
+	// Pause c1 (simulating switcher open), trigger the DA1 query from the session:
+	// daemon MUST auto-answer while paused so the session does not freeze!
+	if err := c1.Pause(true); err != nil {
+		t.Fatalf("c1 pause: %v", err)
+	}
+	if _, err := c1.SendToSession(sess.ID, []byte("go\n")); err != nil {
+		t.Fatalf("trigger query: %v", err)
+	}
+	waitFor(t, 3*time.Second, "paused session unblocked by daemon DA1 reply", func() bool {
+		capResp, err := c1.Capture(protocol.CaptureReq{Target: sess.ID})
+		return err == nil && strings.Contains(capResp.Text, "DA1_UNBLOCKED")
+	})
+
+	// Now client 2 steals "foo" from c1 -> c1 receives DetachedEvent with Stolen=true!
+	outer2 := newOuterTermSink(24, 80)
+	c2, err := client.Dial(sock, outer2)
+	if err != nil {
+		t.Fatalf("dial c2: %v", err)
+	}
+	defer c2.Close()
+	if _, err := c2.Hello(protocol.HelloReq{Size: sz, Term: "xterm-256color", Interactive: true}); err != nil {
+		t.Fatalf("c2 hello: %v", err)
+	}
+	if _, err := c2.Attach(protocol.AttachReq{Target: "foo", Size: sz, ReplayLines: 200}); err != nil {
+		t.Fatalf("c2 attach: %v", err)
+	}
+
+	select {
+	case ev := <-c1.DetachedCh:
+		if !ev.Stolen || ev.SessionID != sess.ID || ev.SessionName != "foo" {
+			t.Fatalf("unexpected DetachedEvent on steal: %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("c1 did not receive DetachedEvent when c2 stole foo")
+	}
+
+	// c2 writes to the stolen session and receives live output.
+	if err := c2.SendStdin([]byte("STOLEN_WRITE_OK\r\n")); err != nil {
+		t.Fatalf("c2 SendStdin: %v", err)
+	}
+	waitFor(t, 2*time.Second, "c2 sees live output", func() bool {
+		return outer2.screenContains("STOLEN_WRITE_OK")
+	})
+
+	_, _ = c2.Kill("", true)
+}

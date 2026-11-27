@@ -394,3 +394,127 @@ func TestSwitcherLiveRefreshRerendersOnlyOnChange(t *testing.T) {
 		t.Fatalf("switcher did not exit cleanly")
 	}
 }
+
+func TestSwitcherAsyncExternalEvents(t *testing.T) {
+	// 1. EventSessionLost while open: clears AllowCancel, updates notice, enables ExitOnEsc.
+	var mu sync.Mutex
+	sessions := []protocol.SessionInfo{
+		{ID: "s1", Name: "foo", Attached: true},
+	}
+	inCh := make(chan []byte, 4)
+	evCh := make(chan ExternalEvent, 4)
+	out := &syncWriteCounter{}
+	doneCh := make(chan Result, 1)
+
+	go func() {
+		doneCh <- Run(Config{
+			CurrentSessionID: "s1",
+			AllowCancel:      true,
+			ExitOnEsc:        false,
+			Rows:             24,
+			Cols:             100,
+			RefreshInterval:  -1,
+			InputCh:          inCh,
+			EventCh:          evCh,
+			Out:              out,
+			Callbacks: Callbacks{
+				ListSessions: func() ([]protocol.SessionInfo, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					cp := make([]protocol.SessionInfo, len(sessions))
+					copy(cp, sessions)
+					return cp, nil
+				},
+			},
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, s := out.snapshot(); strings.Contains(s, "foo") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	evCh <- ExternalEvent{
+		Kind:   EventSessionLost,
+		Notice: `Session "foo" attached by another client`,
+	}
+
+	deadline = time.Now().Add(time.Second)
+	sawNotice := false
+	for time.Now().Before(deadline) {
+		if _, s := out.snapshot(); strings.Contains(s, `Session "foo" attached by another client`) {
+			sawNotice = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sawNotice {
+		t.Fatalf("switcher did not render EventSessionLost notice")
+	}
+
+	// Pressing Esc must now exit cleanly (ActionDetach), NOT ActionCancel!
+	inCh <- []byte{0x1b}
+	select {
+	case res := <-doneCh:
+		if res.Action != ActionDetach {
+			t.Fatalf("expected ActionDetach after EventSessionLost + Esc, got %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("switcher did not exit on Esc after EventSessionLost")
+	}
+
+	// 2. EventForceDetach immediately exits with ForcedDetach=true.
+	evCh2 := make(chan ExternalEvent, 2)
+	doneCh2 := make(chan Result, 1)
+	go func() {
+		doneCh2 <- Run(Config{
+			Rows:            24,
+			Cols:            80,
+			RefreshInterval: -1,
+			InputCh:         make(chan []byte),
+			EventCh:         evCh2,
+			Out:             &syncWriteCounter{},
+			Callbacks: Callbacks{
+				ListSessions: func() ([]protocol.SessionInfo, error) { return sessions, nil },
+			},
+		})
+	}()
+	evCh2 <- ExternalEvent{Kind: EventForceDetach, Notice: "mplex: detached"}
+	select {
+	case res := <-doneCh2:
+		if res.Action != ActionDetach || !res.ForcedDetach || res.Notice != "mplex: detached" {
+			t.Fatalf("unexpected force-detach result: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("switcher did not exit on EventForceDetach")
+	}
+
+	// 3. EventDaemonClosed immediately exits with DaemonClosed=true.
+	evCh3 := make(chan ExternalEvent, 2)
+	doneCh3 := make(chan Result, 1)
+	go func() {
+		doneCh3 <- Run(Config{
+			Rows:            24,
+			Cols:            80,
+			RefreshInterval: -1,
+			InputCh:         make(chan []byte),
+			EventCh:         evCh3,
+			Out:             &syncWriteCounter{},
+			Callbacks: Callbacks{
+				ListSessions: func() ([]protocol.SessionInfo, error) { return sessions, nil },
+			},
+		})
+	}()
+	evCh3 <- ExternalEvent{Kind: EventDaemonClosed}
+	select {
+	case res := <-doneCh3:
+		if res.Action != ActionDetach || !res.DaemonClosed {
+			t.Fatalf("unexpected daemon-closed result: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("switcher did not exit on EventDaemonClosed")
+	}
+}

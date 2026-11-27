@@ -52,6 +52,7 @@ curl -sSL https://github.com/EricWF/mplex/releases/latest/download/mplex-darwin-
 
 # Manage sessions from the CLI
 ./mplex list
+./mplex status              # check if current shell is inside an mplex session (supports -q, --name, --json)
 ./mplex new work -c ~/projects/work
 ./mplex new build -d -- make watch
 ./mplex rename work backend

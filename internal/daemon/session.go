@@ -188,7 +188,7 @@ func (s *Session) readLoop() {
 			copy(chunk, buf[:n])
 
 			s.mu.Lock()
-			if s.client == nil {
+			if s.client == nil || s.paused {
 				s.vt.OnQueryReply = func(reply []byte) {
 					cp := append([]byte(nil), reply...)
 					select {
@@ -326,9 +326,13 @@ func (s *Session) Attach(c *ClientConn, sz protocol.WinSize, replayLines int) (p
 	if prevClient != nil && prevClient != c {
 		s.client = nil
 		s.paused = false
+		s.flushPendingQueriesLocked()
 		prevClient.clearSession(s)
 		prevClient.enqueueJSON(protocol.MsgDetached, protocol.DetachedEvent{
-			Reason: fmt.Sprintf("session %q attached by another client", s.name),
+			Reason:      fmt.Sprintf("session %q attached by another client", s.name),
+			Stolen:      true,
+			SessionID:   s.id,
+			SessionName: s.name,
 		})
 	}
 
@@ -359,6 +363,25 @@ func (s *Session) Attach(c *ClientConn, sz protocol.WinSize, replayLines int) (p
 	return info, nil
 }
 
+// IsExited reports whether this session's child process has already terminated.
+func (s *Session) IsExited() bool {
+	s.mu.Lock()
+	exited := s.exited
+	s.mu.Unlock()
+	return exited
+}
+
+func (s *Session) flushPendingQueriesLocked() {
+	if s.vt.PendingDA1 {
+		s.vt.PendingDA1 = false
+		reply := []byte(s.vt.DefaultDA1Reply())
+		select {
+		case s.queryReplyCh <- reply:
+		default:
+		}
+	}
+}
+
 // Detach disconnects client if it is currently attached to this session.
 func (s *Session) Detach(c *ClientConn) {
 	s.mu.Lock()
@@ -369,6 +392,7 @@ func (s *Session) Detach(c *ClientConn) {
 		}
 		s.client = nil
 		s.paused = false
+		s.flushPendingQueriesLocked()
 	}
 	s.mu.Unlock()
 }
@@ -430,6 +454,7 @@ func (s *Session) SetPaused(c *ClientConn, paused bool) {
 			s.wasInAltAtPause = s.vt.InAltScreen
 			s.lastSeenGen = s.vt.Generation
 			s.lastSeenBell = s.vt.BellCount
+			s.flushPendingQueriesLocked()
 		} else if !paused {
 			s.paused = false
 			s.lastSeenGen = s.vt.Generation

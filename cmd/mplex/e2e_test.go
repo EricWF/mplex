@@ -1645,3 +1645,446 @@ func TestNumericNamingAndWindowTitleDisabled(t *testing.T) {
 		t.Fatalf("expected outer title unchanged ('KEEP_ME') with --window-title=false, got %q", gotTitle)
 	}
 }
+
+func TestStolenSessionDropsOldClientIntoMenu(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	type ptyWin struct {
+		cmd    *exec.Cmd
+		ptmx   *os.File
+		mu     sync.Mutex
+		outer  *vt.Terminal
+		doneCh chan error
+	}
+
+	launch := func(shellPath string, extraEnv []string, args ...string) *ptyWin {
+		t.Helper()
+		fullArgs := append([]string{"--socket", sock}, args...)
+		cmd := exec.Command(bin, fullArgs...)
+		env := append(os.Environ(),
+			"SHELL="+shellPath,
+			"PS1=P$ ",
+			"TERM=xterm-256color",
+			"MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"),
+			"MPLEX_SESSION=",
+			"MPLEX_SESSION_ID=",
+			"MPLEX_SOCKET=",
+			"MPLEX_WINDOW_TITLE=1",
+			"MPLEX_NO_UPDATE_CHECK=1",
+		)
+		env = append(env, extraEnv...)
+		cmd.Env = env
+		ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 110})
+		if err != nil {
+			t.Fatalf("pty.StartWithSize: %v", err)
+		}
+		w := &ptyWin{
+			cmd:    cmd,
+			ptmx:   ptmx,
+			outer:  vt.New(24, 110, 1000),
+			doneCh: make(chan error, 1),
+		}
+		// Simulate an outer terminal emulator replying to DA1/CPR queries (needed by fish 4).
+		w.outer.OnQueryReply = func(reply []byte) {
+			_, _ = ptmx.Write(reply)
+		}
+		go func() {
+			buf := make([]byte, 8192)
+			for {
+				n, err := ptmx.Read(buf)
+				if n > 0 {
+					w.mu.Lock()
+					w.outer.Write(buf[:n])
+					w.mu.Unlock()
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		go func() {
+			w.doneCh <- cmd.Wait()
+		}()
+		t.Cleanup(func() {
+			_ = ptmx.Close()
+		})
+		return w
+	}
+
+	screenOf := func(w *ptyWin) string {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		s := w.outer.Active()
+		var b strings.Builder
+		for r := 0; r < s.Rows; r++ {
+			for _, c := range s.Lines[r].Cells {
+				if c.Width == 0 {
+					continue
+				}
+				if c.Rune == 0 {
+					b.WriteByte(' ')
+				} else {
+					b.WriteRune(c.Rune)
+				}
+			}
+			b.WriteByte('\n')
+		}
+		return b.String()
+	}
+
+	inAltOf := func(w *ptyWin) bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.outer.InAltScreen
+	}
+
+	titleOf := func(w *ptyWin) string {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.outer.Title
+	}
+
+	waitCond := func(w *ptyWin, desc string, fn func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if fn() {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s\n--- SCREEN ---\n%s", desc, screenOf(w))
+	}
+
+	// 1. Window 1 starts mplex and creates session "foo".
+	win1 := launch("/bin/sh", nil, "new", "foo")
+	waitSessionAttached(t, bin, sock, "foo")
+	_, _ = win1.ptmx.Write([]byte("echo WIN1_IN_FOO:$MPLEX_SESSION\n"))
+	waitCond(win1, "win1 in foo", func() bool {
+		return !inAltOf(win1) && strings.Contains(screenOf(win1), "WIN1_IN_FOO:foo")
+	})
+
+	// 2. Window 2 connects to "foo" (stealing it from Window 1) and writes to it!
+	win2 := launch("/bin/sh", nil, "attach", "foo")
+	waitCond(win2, "win2 attached to foo with replay", func() bool {
+		return !inAltOf(win2) && strings.Contains(screenOf(win2), "WIN1_IN_FOO:foo")
+	})
+	_, _ = win2.ptmx.Write([]byte("echo WIN2_WROTE_FOO\n"))
+	waitCond(win2, "win2 output in foo", func() bool {
+		return strings.Contains(screenOf(win2), "WIN2_WROTE_FOO")
+	})
+
+	// 3. Window 1 MUST NOT exit or freeze — it must drop cleanly into the mplex menu
+	// with a notice explaining that "foo" was attached by another client!
+	select {
+	case err := <-win1.doneCh:
+		t.Fatalf("win1 exited instead of dropping into mplex menu (err=%v)", err)
+	default:
+	}
+	waitCond(win1, "win1 dropped into mplex menu with notice", func() bool {
+		txt := screenOf(win1)
+		return inAltOf(win1) &&
+			strings.Contains(txt, "mplex") &&
+			strings.Contains(txt, `Session "foo" attached by another client`) &&
+			strings.Contains(txt, "+ New session") &&
+			titleOf(win1) == ""
+	})
+
+	// 4. Verify Window 1 is responsive in the menu: pressing Enter creates a fresh session!
+	_, _ = win1.ptmx.Write([]byte{'\r'})
+	waitCond(win1, "win1 entered new session from menu", func() bool {
+		return !inAltOf(win1)
+	})
+	_, _ = win1.ptmx.Write([]byte("echo WIN1_NEW_ALIVE:$MPLEX_SESSION\n"))
+	waitCond(win1, "win1 typing works in new session", func() bool {
+		return strings.Contains(screenOf(win1), "WIN1_NEW_ALIVE:") && !strings.Contains(screenOf(win1), "WIN1_NEW_ALIVE:foo")
+	})
+
+	// 5. Verify running `mplex new bar` INSIDE Window 1 switches Window 1 directly to "bar"
+	// instead of accidentally nesting a second mplex client!
+	_, _ = win1.ptmx.Write([]byte(bin + " new bar\n"))
+	waitSessionAttached(t, bin, sock, "bar")
+	waitCond(win1, "win1 switched to bar without nesting", func() bool {
+		return !inAltOf(win1) && titleOf(win1) == "[bar]"
+	})
+	_, _ = win1.ptmx.Write([]byte("echo IN_BAR:$MPLEX_SESSION\n"))
+	waitCond(win1, "bar responsive", func() bool {
+		return strings.Contains(screenOf(win1), "IN_BAR:bar")
+	})
+
+	// 6. Test stealing while Window 1 ALREADY has the switcher menu open!
+	_, _ = win1.ptmx.Write([]byte{0x1c}) // Ctrl-\
+	waitCond(win1, "win1 opened switcher", func() bool {
+		return inAltOf(win1) && strings.Contains(screenOf(win1), "bar")
+	})
+	// Window 2 steals "bar" while Window 1 is in the switcher!
+	// First detach win2 by switching win2 via Ctrl-\ -> filter "bar" -> Enter.
+	_, _ = win2.ptmx.Write([]byte{0x1c})
+	waitCond(win2, "win2 opened switcher", func() bool {
+		return inAltOf(win2) && strings.Contains(screenOf(win2), "bar")
+	})
+	_, _ = win2.ptmx.Write([]byte("bar\r"))
+	waitCond(win2, "win2 stole bar", func() bool {
+		return !inAltOf(win2) && strings.Contains(screenOf(win2), "IN_BAR:bar")
+	})
+	// Window 1 (already in switcher) must update in place with the stolen notice,
+	// and pressing Esc must exit cleanly instead of freezing!
+	waitCond(win1, "win1 switcher updated live with stolen notice", func() bool {
+		return inAltOf(win1) && strings.Contains(screenOf(win1), `Session "bar" attached by another client`)
+	})
+	_, _ = win1.ptmx.Write([]byte{0x1b}) // Esc -> exit cleanly
+	select {
+	case err := <-win1.doneCh:
+		if err != nil {
+			t.Fatalf("win1 exited with error on Esc after steal: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("win1 froze on Esc after session was stolen while switcher was open")
+	}
+
+	// Cleanly exit win2 via external detach.
+	_ = exec.Command(bin, "--socket", sock, "detach").Run()
+	select {
+	case err := <-win2.doneCh:
+		if err != nil {
+			t.Fatalf("win2 exited with error on detach: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("win2 did not exit on detach")
+	}
+
+	// 7. If fish is installed, run the exact fish steal-and-write scenario end-to-end!
+	if fishPath, err := exec.LookPath("fish"); err == nil {
+		t.Run("fish", func(t *testing.T) {
+			fakeHome := filepath.Join(tmp, "fish-home")
+			if err := os.MkdirAll(fakeHome, 0o755); err != nil {
+				t.Fatalf("mkdir fakeHome: %v", err)
+			}
+			extra := []string{"HOME=" + fakeHome}
+
+			f1 := launch(fishPath, extra, "new", "fishfoo")
+			waitSessionAttached(t, bin, sock, "fishfoo")
+			_, _ = f1.ptmx.Write([]byte("echo FISH_ONE:$MPLEX_SESSION\r"))
+			waitCond(f1, "fish win1 output", func() bool {
+				return !inAltOf(f1) && strings.Contains(screenOf(f1), "FISH_ONE:fishfoo")
+			})
+
+			f2 := launch(fishPath, extra, "attach", "fishfoo")
+			waitCond(f2, "fish win2 attached", func() bool {
+				return !inAltOf(f2) && strings.Contains(screenOf(f2), "FISH_ONE:fishfoo")
+			})
+			_, _ = f2.ptmx.Write([]byte("echo FISH_TWO_WRITE\r"))
+			waitCond(f2, "fish win2 wrote to fishfoo", func() bool {
+				return strings.Contains(screenOf(f2), "FISH_TWO_WRITE")
+			})
+
+			// f1 must drop cleanly into the mplex menu and be fully interactive (not frozen!).
+			waitCond(f1, "fish win1 dropped into mplex menu", func() bool {
+				txt := screenOf(f1)
+				return inAltOf(f1) &&
+					strings.Contains(txt, `Session "fishfoo" attached by another client`) &&
+					strings.Contains(txt, "+ New session")
+			})
+
+			// Create a new fish session directly from f1's menu and type in it!
+			_, _ = f1.ptmx.Write([]byte{'\r'})
+			waitCond(f1, "fish win1 created new session", func() bool {
+				return !inAltOf(f1)
+			})
+			_, _ = f1.ptmx.Write([]byte("echo FISH_NEW_OK:$MPLEX_SESSION\r"))
+			waitCond(f1, "fish win1 new session interactive", func() bool {
+				return strings.Contains(screenOf(f1), "FISH_NEW_OK:")
+			})
+
+			// f2 is still live in fishfoo, and stealing fishfoo back from f1 drops f2 into the menu!
+			_, _ = f2.ptmx.Write([]byte("echo FISH_TWO_STILL_OK:$MPLEX_SESSION\r"))
+			waitCond(f2, "fish win2 still interactive", func() bool {
+				return strings.Contains(screenOf(f2), "FISH_TWO_STILL_OK:fishfoo")
+			})
+
+			_, _ = f1.ptmx.Write([]byte{0x1c})
+			waitCond(f1, "fish win1 opened switcher", func() bool {
+				return inAltOf(f1) && strings.Contains(screenOf(f1), "fishfoo")
+			})
+			_, _ = f1.ptmx.Write([]byte("fishfoo\r"))
+			waitCond(f1, "fish win1 stole fishfoo back", func() bool {
+				return !inAltOf(f1) && strings.Contains(screenOf(f1), "FISH_TWO_STILL_OK:fishfoo")
+			})
+			waitCond(f2, "fish win2 dropped into mplex menu on ping-pong steal", func() bool {
+				txt := screenOf(f2)
+				return inAltOf(f2) && strings.Contains(txt, `Session "fishfoo" attached by another client`)
+			})
+
+			// Pressing Esc in f2's menu exits cleanly; Ctrl+\ -> Ctrl+Q in f1 detaches cleanly.
+			_, _ = f2.ptmx.Write([]byte{0x1b})
+			select {
+			case err := <-f2.doneCh:
+				if err != nil {
+					t.Fatalf("fish win2 exited with error on Esc: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("fish win2 did not exit cleanly on Esc")
+			}
+
+			_, _ = f1.ptmx.Write([]byte{0x1c})
+			waitCond(f1, "fish win1 switcher open for detach", func() bool {
+				return inAltOf(f1)
+			})
+			_, _ = f1.ptmx.Write([]byte{0x11}) // Ctrl+Q
+			select {
+			case err := <-f1.doneCh:
+				if err != nil {
+					t.Fatalf("fish win1 exited with error on Ctrl+Q: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("fish win1 did not exit cleanly on Ctrl+Q")
+			}
+		})
+	}
+}
+
+func TestStatusCommandInsideAndOutsideSession(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "mplex")
+	sock := shortTempSock(t)
+
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	defer func() {
+		_ = exec.Command(bin, "--socket", sock, "kill", "--all").Run()
+	}()
+
+	cleanEnv := append(os.Environ(),
+		"MPLEX_CONFIG="+filepath.Join(tmp, "no-config.toml"),
+		"MPLEX_SESSION=",
+		"MPLEX_SESSION_ID=",
+		"MPLEX_SOCKET=",
+		"MPLEX_NO_UPDATE_CHECK=1",
+	)
+
+	// 1. Outside a session: exits 1, reports not in session, and -q prints nothing.
+	cmdOut := exec.Command(bin, "--socket", sock, "status")
+	cmdOut.Env = cleanEnv
+	out, err := cmdOut.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-zero exit outside session, got 0 (out=%q)", out)
+	}
+	if !strings.Contains(string(out), "Not in an mplex session") || strings.Contains(string(out), "mplex:") {
+		t.Fatalf("unexpected outside status output: %q", out)
+	}
+
+	cmdQuiet := exec.Command(bin, "--socket", sock, "status", "-q")
+	cmdQuiet.Env = cleanEnv
+	if qOut, qErr := cmdQuiet.CombinedOutput(); qErr == nil || len(qOut) != 0 {
+		t.Fatalf("expected silent exit 1 for status -q outside session, got err=%v out=%q", qErr, qOut)
+	}
+
+	cmdJSONOut := exec.Command(bin, "--socket", sock, "status", "--json")
+	cmdJSONOut.Env = cleanEnv
+	jOut, jErr := cmdJSONOut.CombinedOutput()
+	if jErr == nil {
+		t.Fatalf("expected exit 1 for status --json outside session")
+	}
+	var stOut struct {
+		InSession bool `json:"in_session"`
+		Stale     bool `json:"stale"`
+	}
+	if err := json.Unmarshal(jOut, &stOut); err != nil || stOut.InSession || stOut.Stale {
+		t.Fatalf("unexpected outside status JSON: %s (err=%v)", jOut, err)
+	}
+
+	// 2. Stale MPLEX_SESSION env pointing at non-existent daemon -> exit 1 + stale=true.
+	cmdStale := exec.Command(bin, "--socket", sock, "status", "--json")
+	cmdStale.Env = append(cleanEnv, "MPLEX_SESSION=ghost", "MPLEX_SESSION_ID=s99", "MPLEX_SOCKET="+sock)
+	staleOut, staleErr := cmdStale.CombinedOutput()
+	if staleErr == nil {
+		t.Fatalf("expected exit 1 for stale MPLEX_SESSION")
+	}
+	if err := json.Unmarshal(staleOut, &stOut); err != nil || stOut.InSession || !stOut.Stale {
+		t.Fatalf("expected stale=true in_session=false, got: %s (err=%v)", staleOut, err)
+	}
+
+	// 3. Create a live session and verify `mplex status` inside it (including after rename!).
+	mk := exec.Command(bin, "--socket", sock, "new", "alpha", "-d", "--json", "--", "/bin/sh")
+	mk.Env = cleanEnv
+	mkOut, err := mk.CombinedOutput()
+	if err != nil {
+		t.Fatalf("create alpha: %v\n%s", err, mkOut)
+	}
+	var created protocol.SessionInfo
+	if err := json.Unmarshal(mkOut, &created); err != nil {
+		t.Fatalf("unmarshal created: %v", err)
+	}
+
+	// Simulate running inside the session (same MPLEX_SESSION / MPLEX_SESSION_ID / MPLEX_SOCKET).
+	inEnv := append(cleanEnv,
+		"MPLEX_SESSION="+created.Name,
+		"MPLEX_SESSION_ID="+created.ID,
+		"MPLEX_SOCKET="+sock,
+	)
+
+	cmdIn := exec.Command(bin, "status")
+	cmdIn.Env = inEnv
+	inOut, err := cmdIn.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status inside session failed: %v\n%s", err, inOut)
+	}
+	if !strings.Contains(string(inOut), `In mplex session "alpha"`) || !strings.Contains(string(inOut), created.ID) {
+		t.Fatalf("unexpected inside status output: %q", inOut)
+	}
+
+	cmdQuietIn := exec.Command(bin, "status", "-q")
+	cmdQuietIn.Env = inEnv
+	if qOut, qErr := cmdQuietIn.CombinedOutput(); qErr != nil || len(qOut) != 0 {
+		t.Fatalf("expected silent exit 0 for status -q inside session, got err=%v out=%q", qErr, qOut)
+	}
+
+	// Rename session to "beta" -> `mplex status --name` & `--json` must report live name "beta"!
+	ren := exec.Command(bin, "--socket", sock, "rename", "alpha", "beta")
+	ren.Env = cleanEnv
+	if out, err := ren.CombinedOutput(); err != nil {
+		t.Fatalf("rename failed: %v\n%s", err, out)
+	}
+
+	cmdName := exec.Command(bin, "whoami", "--name")
+	cmdName.Env = inEnv
+	nameOut, err := cmdName.CombinedOutput()
+	if err != nil {
+		t.Fatalf("whoami --name failed: %v\n%s", err, nameOut)
+	}
+	if strings.TrimSpace(string(nameOut)) != "beta" {
+		t.Fatalf("expected live renamed name 'beta', got %q", nameOut)
+	}
+
+	cmdJSONIn := exec.Command(bin, "status", "--json")
+	cmdJSONIn.Env = inEnv
+	jInOut, err := cmdJSONIn.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status --json inside session failed: %v\n%s", err, jInOut)
+	}
+	var stIn struct {
+		InSession   bool                  `json:"in_session"`
+		SessionName string                `json:"session_name"`
+		SessionID   string                `json:"session_id"`
+		Socket      string                `json:"socket"`
+		Session     *protocol.SessionInfo `json:"session"`
+	}
+	if err := json.Unmarshal(jInOut, &stIn); err != nil {
+		t.Fatalf("unmarshal status json: %v\n%s", err, jInOut)
+	}
+	if !stIn.InSession || stIn.SessionName != "beta" || stIn.SessionID != created.ID || stIn.Socket != sock || stIn.Session == nil {
+		t.Fatalf("unexpected inside status json: %+v", stIn)
+	}
+}

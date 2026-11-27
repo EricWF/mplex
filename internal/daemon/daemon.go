@@ -376,6 +376,12 @@ func (d *Daemon) dispatchFrame(c *ClientConn, frame protocol.Frame) {
 			})
 			return
 		}
+		if sess.IsExited() {
+			c.enqueueJSON(protocol.MsgAttachResp, protocol.AttachResp{
+				Error: "session has exited",
+			})
+			return
+		}
 		// Detach from any previous session first.
 		if prev := c.currentSession(); prev != nil && prev != sess {
 			prev.Detach(c)
